@@ -4,16 +4,15 @@ import json
 
 import boto
 import boto3
-import os
+import csv
 import sure  # noqa
-import sys
 from boto.exception import BotoServerError
 from botocore.exceptions import ClientError
-from dateutil.tz import tzutc
 
-from moto import mock_iam, mock_iam_deprecated
-from moto.iam.models import aws_managed_policies
+from moto import mock_iam, mock_iam_deprecated, settings
 from moto.core import ACCOUNT_ID
+from moto.iam.models import aws_managed_policies
+from moto.backends import get_backend
 from nose.tools import assert_raises, assert_equals
 from nose.tools import raises
 
@@ -202,6 +201,26 @@ def test_remove_role_from_instance_profile():
 
     profile = conn.get_instance_profile("my-profile")
     dict(profile.roles).should.be.empty
+
+
+@mock_iam()
+def test_delete_instance_profile():
+    conn = boto3.client("iam", region_name="us-east-1")
+    conn.create_role(
+        RoleName="my-role", AssumeRolePolicyDocument="some policy", Path="/my-path/"
+    )
+    conn.create_instance_profile(InstanceProfileName="my-profile")
+    conn.add_role_to_instance_profile(
+        InstanceProfileName="my-profile", RoleName="my-role"
+    )
+    with assert_raises(conn.exceptions.DeleteConflictException):
+        conn.delete_instance_profile(InstanceProfileName="my-profile")
+    conn.remove_role_from_instance_profile(
+        InstanceProfileName="my-profile", RoleName="my-role"
+    )
+    conn.delete_instance_profile(InstanceProfileName="my-profile")
+    with assert_raises(conn.exceptions.NoSuchEntityException):
+        profile = conn.get_instance_profile(InstanceProfileName="my-profile")
 
 
 @mock_iam()
@@ -740,6 +759,12 @@ def test_list_users():
     user["Path"].should.equal("/")
     user["Arn"].should.equal("arn:aws:iam::{}:user/my-user".format(ACCOUNT_ID))
 
+    conn.create_user(UserName="my-user-1", Path="myUser")
+    response = conn.list_users(PathPrefix="my")
+    user = response["Users"][0]
+    user["UserName"].should.equal("my-user-1")
+    user["Path"].should.equal("myUser")
+
 
 @mock_iam()
 def test_user_policies():
@@ -1215,6 +1240,69 @@ def test_boto3_get_credential_report():
     report.should.match(r".*my-user.*")
 
 
+@mock_iam
+def test_boto3_get_credential_report_content():
+    conn = boto3.client("iam", region_name="us-east-1")
+    username = "my-user"
+    conn.create_user(UserName=username)
+    key1 = conn.create_access_key(UserName=username)["AccessKey"]
+    conn.update_access_key(
+        UserName=username, AccessKeyId=key1["AccessKeyId"], Status="Inactive"
+    )
+    key1 = conn.create_access_key(UserName=username)["AccessKey"]
+    timestamp = datetime.utcnow()
+    if not settings.TEST_SERVER_MODE:
+        iam_backend = get_backend("iam")["global"]
+        iam_backend.users[username].access_keys[1].last_used = timestamp
+    with assert_raises(ClientError):
+        conn.get_credential_report()
+    result = conn.generate_credential_report()
+    while result["State"] != "COMPLETE":
+        result = conn.generate_credential_report()
+    result = conn.get_credential_report()
+    report = result["Content"].decode("utf-8")
+    header = report.split("\n")[0]
+    header.should.equal(
+        "user,arn,user_creation_time,password_enabled,password_last_used,password_last_changed,password_next_rotation,mfa_active,access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,access_key_1_last_used_region,access_key_1_last_used_service,access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,access_key_2_last_used_region,access_key_2_last_used_service,cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+    )
+    report_dict = csv.DictReader(report.split("\n"))
+    user = next(report_dict)
+    user["user"].should.equal("my-user")
+    user["access_key_1_active"].should.equal("false")
+    user["access_key_1_last_rotated"].should.match(timestamp.strftime("%Y-%m-%d"))
+    user["access_key_1_last_used_date"].should.equal("N/A")
+    user["access_key_2_active"].should.equal("true")
+    if not settings.TEST_SERVER_MODE:
+        user["access_key_2_last_used_date"].should.match(timestamp.strftime("%Y-%m-%d"))
+    else:
+        user["access_key_2_last_used_date"].should.equal("N/A")
+
+
+@mock_iam
+def test_get_access_key_last_used_when_used():
+    iam = boto3.resource("iam", region_name="us-east-1")
+    client = iam.meta.client
+    username = "test-user"
+    iam.create_user(UserName=username)
+    with assert_raises(ClientError):
+        client.get_access_key_last_used(AccessKeyId="non-existent-key-id")
+    create_key_response = client.create_access_key(UserName=username)["AccessKey"]
+    # Set last used date using the IAM backend. Moto currently does not have a mechanism for tracking usage of access keys
+    if not settings.TEST_SERVER_MODE:
+        timestamp = datetime.utcnow()
+        iam_backend = get_backend("iam")["global"]
+        iam_backend.users[username].access_keys[0].last_used = timestamp
+    resp = client.get_access_key_last_used(
+        AccessKeyId=create_key_response["AccessKeyId"]
+    )
+    if not settings.TEST_SERVER_MODE:
+        datetime.strftime(
+            resp["AccessKeyLastUsed"]["LastUsedDate"], "%Y-%m-%d"
+        ).should.equal(timestamp.strftime("%Y-%m-%d"))
+    else:
+        resp["AccessKeyLastUsed"].should_not.contain("LastUsedDate")
+
+
 @requires_boto_gte("2.39")
 @mock_iam_deprecated()
 def test_managed_policy():
@@ -1382,7 +1470,7 @@ def test_update_access_key():
 
 
 @mock_iam
-def test_get_access_key_last_used():
+def test_get_access_key_last_used_when_unused():
     iam = boto3.resource("iam", region_name="us-east-1")
     client = iam.meta.client
     username = "test-user"
@@ -1393,10 +1481,7 @@ def test_get_access_key_last_used():
     resp = client.get_access_key_last_used(
         AccessKeyId=create_key_response["AccessKeyId"]
     )
-
-    datetime.strftime(
-        resp["AccessKeyLastUsed"]["LastUsedDate"], "%Y-%m-%d"
-    ).should.equal(datetime.strftime(datetime.utcnow(), "%Y-%m-%d"))
+    resp["AccessKeyLastUsed"].should_not.contain("LastUsedDate")
     resp["UserName"].should.equal(create_key_response["UserName"])
 
 
@@ -1608,11 +1693,15 @@ def test_get_account_authorization_details():
     assert result["RoleDetailList"][0]["AttachedManagedPolicies"][0][
         "PolicyArn"
     ] == "arn:aws:iam::{}:policy/testPolicy".format(ACCOUNT_ID)
+    assert result["RoleDetailList"][0]["RolePolicyList"][0][
+        "PolicyDocument"
+    ] == json.loads(test_policy)
 
     result = conn.get_account_authorization_details(Filter=["User"])
     assert len(result["RoleDetailList"]) == 0
     assert len(result["UserDetailList"]) == 1
     assert len(result["UserDetailList"][0]["GroupList"]) == 1
+    assert len(result["UserDetailList"][0]["UserPolicyList"]) == 1
     assert len(result["UserDetailList"][0]["AttachedManagedPolicies"]) == 1
     assert len(result["GroupDetailList"]) == 0
     assert len(result["Policies"]) == 0
@@ -1623,6 +1712,9 @@ def test_get_account_authorization_details():
     assert result["UserDetailList"][0]["AttachedManagedPolicies"][0][
         "PolicyArn"
     ] == "arn:aws:iam::{}:policy/testPolicy".format(ACCOUNT_ID)
+    assert result["UserDetailList"][0]["UserPolicyList"][0][
+        "PolicyDocument"
+    ] == json.loads(test_policy)
 
     result = conn.get_account_authorization_details(Filter=["Group"])
     assert len(result["RoleDetailList"]) == 0
@@ -1638,6 +1730,9 @@ def test_get_account_authorization_details():
     assert result["GroupDetailList"][0]["AttachedManagedPolicies"][0][
         "PolicyArn"
     ] == "arn:aws:iam::{}:policy/testPolicy".format(ACCOUNT_ID)
+    assert result["GroupDetailList"][0]["GroupPolicyList"][0][
+        "PolicyDocument"
+    ] == json.loads(test_policy)
 
     result = conn.get_account_authorization_details(Filter=["LocalManagedPolicy"])
     assert len(result["RoleDetailList"]) == 0
@@ -2516,6 +2611,7 @@ def test_update_account_password_policy():
             "RequireNumbers": False,
             "RequireSymbols": False,
             "RequireUppercaseCharacters": False,
+            "HardExpiry": False,
         }
     )
 
@@ -2753,3 +2849,36 @@ def test_list_user_tags():
         [{"Key": "Stan", "Value": "The Caddy"}, {"Key": "like-a", "Value": "glove"}]
     )
     response["IsTruncated"].should_not.be.ok
+
+
+@mock_iam()
+def test_delete_role_with_instance_profiles_present():
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    trust_policy = """
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "ec2.amazonaws.com"
+          },
+          "Action": "sts:AssumeRole"
+        }
+      ]
+    }
+        """
+    trust_policy = trust_policy.strip()
+
+    iam.create_role(RoleName="Role1", AssumeRolePolicyDocument=trust_policy)
+    iam.create_instance_profile(InstanceProfileName="IP1")
+    iam.add_role_to_instance_profile(InstanceProfileName="IP1", RoleName="Role1")
+
+    iam.create_role(RoleName="Role2", AssumeRolePolicyDocument=trust_policy)
+
+    iam.delete_role(RoleName="Role2")
+
+    role_names = [role["RoleName"] for role in iam.list_roles()["Roles"]]
+    assert "Role1" in role_names
+    assert "Role2" not in role_names

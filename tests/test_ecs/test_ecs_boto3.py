@@ -255,6 +255,7 @@ def test_describe_task_definition():
                 "logConfiguration": {"logDriver": "json-file"},
             }
         ],
+        tags=[{"key": "Name", "value": "test_ecs_task"}],
     )
     _ = client.register_task_definition(
         family="test_ecs_task",
@@ -297,6 +298,11 @@ def test_describe_task_definition():
     response["taskDefinition"]["taskDefinitionArn"].should.equal(
         "arn:aws:ecs:us-east-1:012345678910:task-definition/test_ecs_task:2"
     )
+
+    response = client.describe_task_definition(
+        taskDefinition="test_ecs_task:1", include=["TAGS"]
+    )
+    response["tags"].should.equal([{"key": "Name", "value": "test_ecs_task"}])
 
 
 @mock_ecs
@@ -513,6 +519,7 @@ def test_describe_services():
         serviceName="test_ecs_service1",
         taskDefinition="test_ecs_task",
         desiredCount=2,
+        tags=[{"key": "Name", "value": "test_ecs_service1"}],
     )
     _ = client.create_service(
         cluster="test_ecs_cluster",
@@ -555,6 +562,18 @@ def test_describe_services():
         datetime.now()
         - response["services"][0]["deployments"][0]["updatedAt"].replace(tzinfo=None)
     ).seconds.should.be.within(0, 10)
+    response = client.describe_services(
+        cluster="test_ecs_cluster",
+        services=[
+            "test_ecs_service1",
+            "arn:aws:ecs:us-east-1:012345678910:service/test_ecs_service2",
+        ],
+        include=["TAGS"],
+    )
+    response["services"][0]["tags"].should.equal(
+        [{"key": "Name", "value": "test_ecs_service1"}]
+    )
+    response["services"][1]["tags"].should.equal([])
 
     time.sleep(10)  # tasks move from pending to running after 10s
 
@@ -680,6 +699,15 @@ def test_update_service():
     )
     response["service"]["desiredCount"].should.equal(0)
     response["service"]["schedulingStrategy"].should.equal("REPLICA")
+
+    # Verify we can pass the ARNs of the cluster and service
+    response = client.update_service(
+        cluster=response["service"]["clusterArn"],
+        service=response["service"]["serviceArn"],
+        taskDefinition="test_ecs_task",
+        desiredCount=1,
+    )
+    response["service"]["desiredCount"].should.equal(1)
 
 
 @mock_ecs
@@ -1132,6 +1160,71 @@ def test_run_task():
     )
     response["tasks"][0]["clusterArn"].should.equal(
         "arn:aws:ecs:us-east-1:012345678910:cluster/test_ecs_cluster"
+    )
+    response["tasks"][0]["taskDefinitionArn"].should.equal(
+        "arn:aws:ecs:us-east-1:012345678910:task-definition/test_ecs_task:1"
+    )
+    response["tasks"][0]["containerInstanceArn"].should.contain(
+        "arn:aws:ecs:us-east-1:012345678910:container-instance/"
+    )
+    response["tasks"][0]["overrides"].should.equal({})
+    response["tasks"][0]["lastStatus"].should.equal("RUNNING")
+    response["tasks"][0]["desiredStatus"].should.equal("RUNNING")
+    response["tasks"][0]["startedBy"].should.equal("moto")
+    response["tasks"][0]["stoppedReason"].should.equal("")
+
+
+@mock_ec2
+@mock_ecs
+def test_run_task_default_cluster():
+    client = boto3.client("ecs", region_name="us-east-1")
+    ec2 = boto3.resource("ec2", region_name="us-east-1")
+
+    test_cluster_name = "default"
+
+    _ = client.create_cluster(clusterName=test_cluster_name)
+
+    test_instance = ec2.create_instances(
+        ImageId="ami-1234abcd", MinCount=1, MaxCount=1
+    )[0]
+
+    instance_id_document = json.dumps(
+        ec2_utils.generate_instance_identity_document(test_instance)
+    )
+
+    response = client.register_container_instance(
+        cluster=test_cluster_name, instanceIdentityDocument=instance_id_document
+    )
+
+    _ = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    response = client.run_task(
+        launchType="FARGATE",
+        overrides={},
+        taskDefinition="test_ecs_task",
+        count=2,
+        startedBy="moto",
+    )
+    len(response["tasks"]).should.equal(2)
+    response["tasks"][0]["taskArn"].should.contain(
+        "arn:aws:ecs:us-east-1:012345678910:task/"
+    )
+    response["tasks"][0]["clusterArn"].should.equal(
+        "arn:aws:ecs:us-east-1:012345678910:cluster/default"
     )
     response["tasks"][0]["taskDefinitionArn"].should.equal(
         "arn:aws:ecs:us-east-1:012345678910:task-definition/test_ecs_task:1"
@@ -2563,3 +2656,365 @@ def test_ecs_service_untag_resource_multiple_tags():
         resourceArn=response["service"]["serviceArn"]
     )
     response["tags"].should.equal([{"key": "hello", "value": "world"}])
+
+
+@mock_ecs
+def test_ecs_task_definition_placement_constraints():
+    client = boto3.client("ecs", region_name="us-east-1")
+    response = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+        networkMode="bridge",
+        tags=[
+            {"key": "createdBy", "value": "moto-unittest"},
+            {"key": "foo", "value": "bar"},
+        ],
+        placementConstraints=[
+            {"type": "memberOf", "expression": "attribute:ecs.instance-type =~ t2.*"}
+        ],
+    )
+    type(response["taskDefinition"]["placementConstraints"]).should.be(list)
+    response["taskDefinition"]["placementConstraints"].should.equal(
+        [{"type": "memberOf", "expression": "attribute:ecs.instance-type =~ t2.*"}]
+    )
+
+
+@mock_ecs
+def test_create_task_set():
+    cluster_name = "test_ecs_cluster"
+    service_name = "test_ecs_service"
+    task_def_name = "test_ecs_task"
+
+    client = boto3.client("ecs", region_name="us-east-1")
+    _ = client.create_cluster(clusterName=cluster_name)
+    _ = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    _ = client.create_service(
+        cluster=cluster_name,
+        serviceName=service_name,
+        taskDefinition=task_def_name,
+        desiredCount=2,
+        deploymentController={"type": "EXTERNAL"},
+    )
+    load_balancers = [
+        {
+            "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:01234567890:targetgroup/c26b93c1bc35466ba792d5b08fe6a5bc/ec39113f8831453a",
+            "containerName": "hello_world",
+            "containerPort": 8080,
+        },
+    ]
+
+    task_set = client.create_task_set(
+        cluster=cluster_name,
+        service=service_name,
+        taskDefinition=task_def_name,
+        loadBalancers=load_balancers,
+    )["taskSet"]
+
+    cluster_arn = client.describe_clusters(clusters=[cluster_name])["clusters"][0][
+        "clusterArn"
+    ]
+    service_arn = client.describe_services(
+        cluster=cluster_name, services=[service_name]
+    )["services"][0]["serviceArn"]
+    assert task_set["clusterArn"] == cluster_arn
+    assert task_set["serviceArn"] == service_arn
+    assert task_set["taskDefinition"].endswith("{0}:1".format(task_def_name))
+    assert task_set["scale"] == {"value": 100.0, "unit": "PERCENT"}
+    assert (
+        task_set["loadBalancers"][0]["targetGroupArn"]
+        == "arn:aws:elasticloadbalancing:us-east-1:01234567890:targetgroup/c26b93c1bc35466ba792d5b08fe6a5bc/ec39113f8831453a"
+    )
+    assert task_set["loadBalancers"][0]["containerPort"] == 8080
+    assert task_set["loadBalancers"][0]["containerName"] == "hello_world"
+
+
+@mock_ecs
+def test_describe_task_sets():
+    cluster_name = "test_ecs_cluster"
+    service_name = "test_ecs_service"
+    task_def_name = "test_ecs_task"
+
+    client = boto3.client("ecs", region_name="us-east-1")
+    _ = client.create_cluster(clusterName=cluster_name)
+    _ = client.register_task_definition(
+        family=task_def_name,
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    _ = client.create_service(
+        cluster=cluster_name,
+        serviceName=service_name,
+        taskDefinition=task_def_name,
+        desiredCount=2,
+        deploymentController={"type": "EXTERNAL"},
+    )
+
+    load_balancers = [
+        {
+            "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:01234567890:targetgroup/c26b93c1bc35466ba792d5b08fe6a5bc/ec39113f8831453a",
+            "containerName": "hello_world",
+            "containerPort": 8080,
+        }
+    ]
+
+    _ = client.create_task_set(
+        cluster=cluster_name,
+        service=service_name,
+        taskDefinition=task_def_name,
+        loadBalancers=load_balancers,
+    )
+    task_sets = client.describe_task_sets(cluster=cluster_name, service=service_name)[
+        "taskSets"
+    ]
+    assert "tags" not in task_sets[0]
+
+    task_sets = client.describe_task_sets(
+        cluster=cluster_name, service=service_name, include=["TAGS"],
+    )["taskSets"]
+
+    cluster_arn = client.describe_clusters(clusters=[cluster_name])["clusters"][0][
+        "clusterArn"
+    ]
+
+    service_arn = client.describe_services(
+        cluster=cluster_name, services=[service_name]
+    )["services"][0]["serviceArn"]
+
+    assert "tags" in task_sets[0]
+    assert len(task_sets) == 1
+    assert task_sets[0]["taskDefinition"].endswith("{0}:1".format(task_def_name))
+    assert task_sets[0]["clusterArn"] == cluster_arn
+    assert task_sets[0]["serviceArn"] == service_arn
+    assert task_sets[0]["serviceArn"].endswith(service_name)
+    assert task_sets[0]["scale"] == {"value": 100.0, "unit": "PERCENT"}
+    assert task_sets[0]["taskSetArn"].endswith(task_sets[0]["id"])
+    assert (
+        task_sets[0]["loadBalancers"][0]["targetGroupArn"]
+        == "arn:aws:elasticloadbalancing:us-east-1:01234567890:targetgroup/c26b93c1bc35466ba792d5b08fe6a5bc/ec39113f8831453a"
+    )
+    assert task_sets[0]["loadBalancers"][0]["containerPort"] == 8080
+    assert task_sets[0]["loadBalancers"][0]["containerName"] == "hello_world"
+
+
+@mock_ecs
+def test_delete_task_set():
+    cluster_name = "test_ecs_cluster"
+    service_name = "test_ecs_service"
+    task_def_name = "test_ecs_task"
+
+    client = boto3.client("ecs", region_name="us-east-1")
+    _ = client.create_cluster(clusterName=cluster_name)
+    _ = client.register_task_definition(
+        family=task_def_name,
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    _ = client.create_service(
+        cluster=cluster_name,
+        serviceName=service_name,
+        taskDefinition=task_def_name,
+        desiredCount=2,
+        deploymentController={"type": "EXTERNAL"},
+    )
+
+    task_set = client.create_task_set(
+        cluster=cluster_name, service=service_name, taskDefinition=task_def_name,
+    )["taskSet"]
+
+    task_sets = client.describe_task_sets(
+        cluster=cluster_name, service=service_name, taskSets=[task_set["taskSetArn"]],
+    )["taskSets"]
+
+    assert len(task_sets) == 1
+
+    response = client.delete_task_set(
+        cluster=cluster_name, service=service_name, taskSet=task_set["taskSetArn"],
+    )
+    assert response["taskSet"]["taskSetArn"] == task_set["taskSetArn"]
+
+    task_sets = client.describe_task_sets(
+        cluster=cluster_name, service=service_name, taskSets=[task_set["taskSetArn"]],
+    )["taskSets"]
+
+    assert len(task_sets) == 0
+
+    with assert_raises(ClientError):
+        _ = client.delete_task_set(
+            cluster=cluster_name, service=service_name, taskSet=task_set["taskSetArn"],
+        )
+
+
+@mock_ecs
+def test_update_service_primary_task_set():
+    cluster_name = "test_ecs_cluster"
+    service_name = "test_ecs_service"
+    task_def_name = "test_ecs_task"
+
+    client = boto3.client("ecs", region_name="us-east-1")
+    _ = client.create_cluster(clusterName=cluster_name)
+    _ = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    _ = client.create_service(
+        cluster=cluster_name,
+        serviceName=service_name,
+        desiredCount=2,
+        deploymentController={"type": "EXTERNAL"},
+    )
+
+    task_set = client.create_task_set(
+        cluster=cluster_name, service=service_name, taskDefinition=task_def_name,
+    )["taskSet"]
+
+    service = client.describe_services(cluster=cluster_name, services=[service_name],)[
+        "services"
+    ][0]
+
+    _ = client.update_service_primary_task_set(
+        cluster=cluster_name,
+        service=service_name,
+        primaryTaskSet=task_set["taskSetArn"],
+    )
+
+    service = client.describe_services(cluster=cluster_name, services=[service_name],)[
+        "services"
+    ][0]
+    assert service["taskSets"][0]["status"] == "PRIMARY"
+    assert service["taskDefinition"] == service["taskSets"][0]["taskDefinition"]
+
+    another_task_set = client.create_task_set(
+        cluster=cluster_name, service=service_name, taskDefinition=task_def_name,
+    )["taskSet"]
+    service = client.describe_services(cluster=cluster_name, services=[service_name],)[
+        "services"
+    ][0]
+    assert service["taskSets"][1]["status"] == "ACTIVE"
+
+    _ = client.update_service_primary_task_set(
+        cluster=cluster_name,
+        service=service_name,
+        primaryTaskSet=another_task_set["taskSetArn"],
+    )
+    service = client.describe_services(cluster=cluster_name, services=[service_name],)[
+        "services"
+    ][0]
+    assert service["taskSets"][0]["status"] == "ACTIVE"
+    assert service["taskSets"][1]["status"] == "PRIMARY"
+    assert service["taskDefinition"] == service["taskSets"][1]["taskDefinition"]
+
+
+@mock_ecs
+def test_update_task_set():
+    cluster_name = "test_ecs_cluster"
+    service_name = "test_ecs_service"
+    task_def_name = "test_ecs_task"
+
+    client = boto3.client("ecs", region_name="us-east-1")
+    _ = client.create_cluster(clusterName=cluster_name)
+    _ = client.register_task_definition(
+        family=task_def_name,
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    _ = client.create_service(
+        cluster=cluster_name,
+        serviceName=service_name,
+        desiredCount=2,
+        deploymentController={"type": "EXTERNAL"},
+    )
+
+    task_set = client.create_task_set(
+        cluster=cluster_name, service=service_name, taskDefinition=task_def_name,
+    )["taskSet"]
+
+    another_task_set = client.create_task_set(
+        cluster=cluster_name, service=service_name, taskDefinition=task_def_name,
+    )["taskSet"]
+    assert another_task_set["scale"]["unit"] == "PERCENT"
+    assert another_task_set["scale"]["value"] == 100.0
+
+    client.update_task_set(
+        cluster=cluster_name,
+        service=service_name,
+        taskSet=task_set["taskSetArn"],
+        scale={"value": 25.0, "unit": "PERCENT"},
+    )
+
+    updated_task_set = client.describe_task_sets(
+        cluster=cluster_name, service=service_name, taskSets=[task_set["taskSetArn"]],
+    )["taskSets"][0]
+    assert updated_task_set["scale"]["value"] == 25.0
+    assert updated_task_set["scale"]["unit"] == "PERCENT"

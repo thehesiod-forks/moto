@@ -9,8 +9,13 @@ import six
 
 from moto.core.responses import BaseResponse
 from moto.core.utils import camelcase_to_underscores, amzn_request_id
-from .exceptions import InvalidIndexNameError, InvalidUpdateExpression, ItemSizeTooLarge
-from .models import dynamodb_backends, dynamo_json_dump
+from .exceptions import (
+    InvalidIndexNameError,
+    ItemSizeTooLarge,
+    MockValidationException,
+    TransactionCanceledException,
+)
+from moto.dynamodb2.models import dynamodb_backends, dynamo_json_dump
 
 
 TRANSACTION_MAX_ITEMS = 25
@@ -92,19 +97,14 @@ class DynamoHandler(BaseResponse):
     def list_tables(self):
         body = self.body
         limit = body.get("Limit", 100)
-        if body.get("ExclusiveStartTableName"):
-            last = body.get("ExclusiveStartTableName")
-            start = list(self.dynamodb_backend.tables.keys()).index(last) + 1
-        else:
-            start = 0
-        all_tables = list(self.dynamodb_backend.tables.keys())
-        if limit:
-            tables = all_tables[start : start + limit]
-        else:
-            tables = all_tables[start:]
+        exclusive_start_table_name = body.get("ExclusiveStartTableName")
+        tables, last_eval = self.dynamodb_backend.list_tables(
+            limit, exclusive_start_table_name
+        )
+
         response = {"TableNames": tables}
-        if limit and len(all_tables) > start + limit:
-            response["LastEvaluatedTableName"] = tables[-1]
+        if last_eval:
+            response["LastEvaluatedTableName"] = last_eval
 
         return dynamo_json_dump(response)
 
@@ -224,33 +224,29 @@ class DynamoHandler(BaseResponse):
 
     def update_table(self):
         name = self.body["TableName"]
-        table = self.dynamodb_backend.get_table(name)
-        if "GlobalSecondaryIndexUpdates" in self.body:
-            table = self.dynamodb_backend.update_table_global_indexes(
-                name, self.body["GlobalSecondaryIndexUpdates"]
+        global_index = self.body.get("GlobalSecondaryIndexUpdates", None)
+        throughput = self.body.get("ProvisionedThroughput", None)
+        stream_spec = self.body.get("StreamSpecification", None)
+        try:
+            table = self.dynamodb_backend.update_table(
+                name=name,
+                global_index=global_index,
+                throughput=throughput,
+                stream_spec=stream_spec,
             )
-        if "ProvisionedThroughput" in self.body:
-            throughput = self.body["ProvisionedThroughput"]
-            table = self.dynamodb_backend.update_table_throughput(name, throughput)
-        if "StreamSpecification" in self.body:
-            try:
-                table = self.dynamodb_backend.update_table_streams(
-                    name, self.body["StreamSpecification"]
-                )
-            except ValueError:
-                er = "com.amazonaws.dynamodb.v20111205#ResourceInUseException"
-                return self.error(er, "Cannot enable stream")
-
-        return dynamo_json_dump(table.describe())
+            return dynamo_json_dump(table.describe())
+        except ValueError:
+            er = "com.amazonaws.dynamodb.v20111205#ResourceInUseException"
+            return self.error(er, "Cannot enable stream")
 
     def describe_table(self):
         name = self.body["TableName"]
         try:
-            table = self.dynamodb_backend.tables[name]
+            table = self.dynamodb_backend.describe_table(name)
+            return dynamo_json_dump(table)
         except KeyError:
             er = "com.amazonaws.dynamodb.v20111205#ResourceNotFoundException"
             return self.error(er, "Requested resource not found")
-        return dynamo_json_dump(table.describe(base_key="Table"))
 
     def put_item(self):
         name = self.body["TableName"]
@@ -298,7 +294,7 @@ class DynamoHandler(BaseResponse):
             )
         except ItemSizeTooLarge:
             er = "com.amazonaws.dynamodb.v20111205#ValidationException"
-            return self.error(er, ItemSizeTooLarge.message)
+            return self.error(er, ItemSizeTooLarge.item_size_too_large_msg)
         except KeyError as ke:
             er = "com.amazonaws.dynamodb.v20111205#ValidationException"
             return self.error(er, ke.args[0])
@@ -375,6 +371,26 @@ class DynamoHandler(BaseResponse):
 
         results = {"ConsumedCapacity": [], "Responses": {}, "UnprocessedKeys": {}}
 
+        # Validation: Can only request up to 100 items at the same time
+        # Scenario 1: We're requesting more than a 100 keys from a single table
+        for table_name, table_request in table_batches.items():
+            if len(table_request["Keys"]) > 100:
+                return self.error(
+                    "com.amazonaws.dynamodb.v20111205#ValidationException",
+                    "1 validation error detected: Value at 'requestItems."
+                    + table_name
+                    + ".member.keys' failed to satisfy constraint: Member must have length less than or equal to 100",
+                )
+        # Scenario 2: We're requesting more than a 100 keys across all tables
+        nr_of_keys_across_all_tables = sum(
+            [len(req["Keys"]) for _, req in table_batches.items()]
+        )
+        if nr_of_keys_across_all_tables > 100:
+            return self.error(
+                "com.amazonaws.dynamodb.v20111205#ValidationException",
+                "Too many items requested for the BatchGetItem call",
+            )
+
         for table_name, table_request in table_batches.items():
             keys = table_request["Keys"]
             if self._contains_duplicates(keys):
@@ -415,7 +431,6 @@ class DynamoHandler(BaseResponse):
 
     def query(self):
         name = self.body["TableName"]
-        # {u'KeyConditionExpression': u'#n0 = :v0', u'ExpressionAttributeValues': {u':v0': {u'S': u'johndoe'}}, u'ExpressionAttributeNames': {u'#n0': u'username'}}
         key_condition_expression = self.body.get("KeyConditionExpression")
         projection_expression = self.body.get("ProjectionExpression")
         expression_attribute_names = self.body.get("ExpressionAttributeNames", {})
@@ -443,7 +458,7 @@ class DynamoHandler(BaseResponse):
             index_name = self.body.get("IndexName")
             if index_name:
                 all_indexes = (table.global_indexes or []) + (table.indexes or [])
-                indexes_by_name = dict((i["IndexName"], i) for i in all_indexes)
+                indexes_by_name = dict((i.name, i) for i in all_indexes)
                 if index_name not in indexes_by_name:
                     er = "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException"
                     return self.error(
@@ -453,7 +468,7 @@ class DynamoHandler(BaseResponse):
                         ),
                     )
 
-                index = indexes_by_name[index_name]["KeySchema"]
+                index = indexes_by_name[index_name].schema
             else:
                 index = table.schema
 
@@ -462,8 +477,10 @@ class DynamoHandler(BaseResponse):
                 for k, v in six.iteritems(self.body.get("ExpressionAttributeNames", {}))
             )
 
-            if " AND " in key_condition_expression:
-                expressions = key_condition_expression.split(" AND ", 1)
+            if " and " in key_condition_expression.lower():
+                expressions = re.split(
+                    " AND ", key_condition_expression, maxsplit=1, flags=re.IGNORECASE
+                )
 
                 index_hash_key = [key for key in index if key["KeyType"] == "HASH"][0]
                 hash_key_var = reverse_attribute_lookup.get(
@@ -748,31 +765,20 @@ class DynamoHandler(BaseResponse):
         expression_attribute_names = self.body.get("ExpressionAttributeNames", {})
         expression_attribute_values = self.body.get("ExpressionAttributeValues", {})
 
-        # Support spaces between operators in an update expression
-        # E.g. `a = b + c` -> `a=b+c`
-        if update_expression:
-            update_expression = re.sub(r"\s*([=\+-])\s*", "\\1", update_expression)
-
         try:
             item = self.dynamodb_backend.update_item(
                 name,
                 key,
-                update_expression,
-                attribute_updates,
-                expression_attribute_names,
-                expression_attribute_values,
-                expected,
-                condition_expression,
+                update_expression=update_expression,
+                attribute_updates=attribute_updates,
+                expression_attribute_names=expression_attribute_names,
+                expression_attribute_values=expression_attribute_values,
+                expected=expected,
+                condition_expression=condition_expression,
             )
-        except InvalidUpdateExpression:
+        except MockValidationException as mve:
             er = "com.amazonaws.dynamodb.v20111205#ValidationException"
-            return self.error(
-                er,
-                "The document path provided in the update expression is invalid for update",
-            )
-        except ItemSizeTooLarge:
-            er = "com.amazonaws.dynamodb.v20111205#ValidationException"
-            return self.error(er, ItemSizeTooLarge.message)
+            return self.error(er, mve.exception_msg)
         except ValueError:
             er = "com.amazonaws.dynamodb.v20111205#ConditionalCheckFailedException"
             return self.error(
@@ -851,14 +857,14 @@ class DynamoHandler(BaseResponse):
         name = self.body["TableName"]
         ttl_spec = self.body["TimeToLiveSpecification"]
 
-        self.dynamodb_backend.update_ttl(name, ttl_spec)
+        self.dynamodb_backend.update_time_to_live(name, ttl_spec)
 
         return json.dumps({"TimeToLiveSpecification": ttl_spec})
 
     def describe_time_to_live(self):
         name = self.body["TableName"]
 
-        ttl_spec = self.dynamodb_backend.describe_ttl(name)
+        ttl_spec = self.dynamodb_backend.describe_time_to_live(name)
 
         return json.dumps({"TimeToLiveDescription": ttl_spec})
 
@@ -925,3 +931,42 @@ class DynamoHandler(BaseResponse):
             result.update({"ConsumedCapacity": [v for v in consumed_capacity.values()]})
 
         return dynamo_json_dump(result)
+
+    def transact_write_items(self):
+        transact_items = self.body["TransactItems"]
+        try:
+            self.dynamodb_backend.transact_write_items(transact_items)
+        except TransactionCanceledException as e:
+            er = "com.amazonaws.dynamodb.v20111205#TransactionCanceledException"
+            return self.error(er, str(e))
+        response = {"ConsumedCapacity": [], "ItemCollectionMetrics": {}}
+        return dynamo_json_dump(response)
+
+    def describe_continuous_backups(self):
+        name = self.body["TableName"]
+
+        if self.dynamodb_backend.get_table(name) is None:
+            return self.error(
+                "com.amazonaws.dynamodb.v20111205#TableNotFoundException",
+                "Table not found: {}".format(name),
+            )
+
+        response = self.dynamodb_backend.describe_continuous_backups(name)
+
+        return json.dumps({"ContinuousBackupsDescription": response})
+
+    def update_continuous_backups(self):
+        name = self.body["TableName"]
+        point_in_time_spec = self.body["PointInTimeRecoverySpecification"]
+
+        if self.dynamodb_backend.get_table(name) is None:
+            return self.error(
+                "com.amazonaws.dynamodb.v20111205#TableNotFoundException",
+                "Table not found: {}".format(name),
+            )
+
+        response = self.dynamodb_backend.update_continuous_backups(
+            name, point_in_time_spec
+        )
+
+        return json.dumps({"ContinuousBackupsDescription": response})

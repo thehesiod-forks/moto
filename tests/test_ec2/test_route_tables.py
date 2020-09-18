@@ -462,7 +462,7 @@ def test_routes_not_supported():
     # Create
     conn.create_route.when.called_with(
         main_route_table.id, ROUTE_CIDR, interface_id="eni-1234abcd"
-    ).should.throw(NotImplementedError)
+    ).should.throw("InvalidNetworkInterfaceID.NotFound")
 
     # Replace
     igw = conn.create_internet_gateway()
@@ -582,6 +582,43 @@ def test_create_route_with_invalid_destination_cidr_block_parameter():
         )
     )
 
+    route_table.create_route(
+        DestinationIpv6CidrBlock="2001:db8::/125", GatewayId=internet_gateway.id
+    )
+    new_routes = [
+        route
+        for route in route_table.routes
+        if route.destination_cidr_block != vpc.cidr_block
+    ]
+    new_routes.should.have.length_of(1)
+    new_routes[0].route_table_id.shouldnt.be.equal(None)
+
+
+@mock_ec2
+def test_create_route_with_network_interface_id():
+    ec2 = boto3.resource("ec2", region_name="us-west-2")
+    ec2_client = boto3.client("ec2", region_name="us-west-2")
+
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    subnet = ec2.create_subnet(
+        VpcId=vpc.id, CidrBlock="10.0.0.0/24", AvailabilityZone="us-west-2a"
+    )
+
+    route_table = ec2_client.create_route_table(VpcId=vpc.id)
+
+    route_table_id = route_table["RouteTable"]["RouteTableId"]
+
+    eni1 = ec2_client.create_network_interface(
+        SubnetId=subnet.id, PrivateIpAddress="10.0.10.5"
+    )
+
+    route = ec2_client.create_route(
+        NetworkInterfaceId=eni1["NetworkInterface"]["NetworkInterfaceId"],
+        RouteTableId=route_table_id,
+    )
+
+    route["ResponseMetadata"]["HTTPStatusCode"].should.equal(200)
+
 
 @mock_ec2
 def test_describe_route_tables_with_nat_gateway():
@@ -618,3 +655,63 @@ def test_describe_route_tables_with_nat_gateway():
     nat_gw_routes[0]["DestinationCidrBlock"].should.equal("0.0.0.0/0")
     nat_gw_routes[0]["NatGatewayId"].should.equal(nat_gw_id)
     nat_gw_routes[0]["State"].should.equal("active")
+
+
+@mock_ec2
+def test_create_vpc_end_point():
+
+    ec2 = boto3.client("ec2", region_name="us-west-1")
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    subnet = ec2.create_subnet(VpcId=vpc["Vpc"]["VpcId"], CidrBlock="10.0.0.0/24")
+
+    route_table = ec2.create_route_table(VpcId=vpc["Vpc"]["VpcId"])
+
+    # test without any end point type specified
+    vpc_end_point = ec2.create_vpc_endpoint(
+        VpcId=vpc["Vpc"]["VpcId"],
+        ServiceName="com.amazonaws.us-east-1.s3",
+        RouteTableIds=[route_table["RouteTable"]["RouteTableId"]],
+    )
+
+    vpc_end_point["VpcEndpoint"]["ServiceName"].should.equal(
+        "com.amazonaws.us-east-1.s3"
+    )
+    vpc_end_point["VpcEndpoint"]["RouteTableIds"][0].should.equal(
+        route_table["RouteTable"]["RouteTableId"]
+    )
+    vpc_end_point["VpcEndpoint"]["VpcId"].should.equal(vpc["Vpc"]["VpcId"])
+    vpc_end_point["VpcEndpoint"]["DnsEntries"].should.have.length_of(0)
+
+    # test with any end point type as gateway
+    vpc_end_point = ec2.create_vpc_endpoint(
+        VpcId=vpc["Vpc"]["VpcId"],
+        ServiceName="com.amazonaws.us-east-1.s3",
+        RouteTableIds=[route_table["RouteTable"]["RouteTableId"]],
+        VpcEndpointType="gateway",
+    )
+
+    vpc_end_point["VpcEndpoint"]["ServiceName"].should.equal(
+        "com.amazonaws.us-east-1.s3"
+    )
+    vpc_end_point["VpcEndpoint"]["RouteTableIds"][0].should.equal(
+        route_table["RouteTable"]["RouteTableId"]
+    )
+    vpc_end_point["VpcEndpoint"]["VpcId"].should.equal(vpc["Vpc"]["VpcId"])
+    vpc_end_point["VpcEndpoint"]["DnsEntries"].should.have.length_of(0)
+
+    # test with end point type as interface
+    vpc_end_point = ec2.create_vpc_endpoint(
+        VpcId=vpc["Vpc"]["VpcId"],
+        ServiceName="com.amazonaws.us-east-1.s3",
+        SubnetIds=[subnet["Subnet"]["SubnetId"]],
+        VpcEndpointType="interface",
+    )
+
+    vpc_end_point["VpcEndpoint"]["ServiceName"].should.equal(
+        "com.amazonaws.us-east-1.s3"
+    )
+    vpc_end_point["VpcEndpoint"]["SubnetIds"][0].should.equal(
+        subnet["Subnet"]["SubnetId"]
+    )
+    vpc_end_point["VpcEndpoint"]["VpcId"].should.equal(vpc["Vpc"]["VpcId"])
+    len(vpc_end_point["VpcEndpoint"]["DnsEntries"]).should.be.greater_than(0)

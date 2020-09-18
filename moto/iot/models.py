@@ -20,6 +20,7 @@ from .exceptions import (
     InvalidStateTransitionException,
     VersionConflictException,
 )
+from moto.utilities.utils import random_string
 
 
 class FakeThing(BaseModel):
@@ -374,6 +375,55 @@ class FakeJobExecution(BaseModel):
         return obj
 
 
+class FakeEndpoint(BaseModel):
+    def __init__(self, endpoint_type, region_name):
+        if endpoint_type not in [
+            "iot:Data",
+            "iot:Data-ATS",
+            "iot:CredentialProvider",
+            "iot:Jobs",
+        ]:
+            raise InvalidRequestException(
+                " An error occurred (InvalidRequestException) when calling the DescribeEndpoint "
+                "operation: Endpoint type %s not recognized." % endpoint_type
+            )
+        self.region_name = region_name
+        data_identifier = random_string(14)
+        if endpoint_type == "iot:Data":
+            self.endpoint = "{i}.iot.{r}.amazonaws.com".format(
+                i=data_identifier, r=self.region_name
+            )
+        elif "iot:Data-ATS" in endpoint_type:
+            self.endpoint = "{i}-ats.iot.{r}.amazonaws.com".format(
+                i=data_identifier, r=self.region_name
+            )
+        elif "iot:CredentialProvider" in endpoint_type:
+            identifier = random_string(14)
+            self.endpoint = "{i}.credentials.iot.{r}.amazonaws.com".format(
+                i=identifier, r=self.region_name
+            )
+        elif "iot:Jobs" in endpoint_type:
+            identifier = random_string(14)
+            self.endpoint = "{i}.jobs.iot.{r}.amazonaws.com".format(
+                i=identifier, r=self.region_name
+            )
+        self.endpoint_type = endpoint_type
+
+    def to_get_dict(self):
+        obj = {
+            "endpointAddress": self.endpoint,
+        }
+
+        return obj
+
+    def to_dict(self):
+        obj = {
+            "endpointAddress": self.endpoint,
+        }
+
+        return obj
+
+
 class IoTBackend(BaseBackend):
     def __init__(self, region_name=None):
         super(IoTBackend, self).__init__()
@@ -387,6 +437,7 @@ class IoTBackend(BaseBackend):
         self.policies = OrderedDict()
         self.principal_policies = OrderedDict()
         self.principal_things = OrderedDict()
+        self.endpoint = None
 
     def reset(self):
         region_name = self.region_name
@@ -494,6 +545,10 @@ class IoTBackend(BaseBackend):
         if len(thing_types) == 0:
             raise ResourceNotFoundException()
         return thing_types[0]
+
+    def describe_endpoint(self, endpoint_type):
+        self.endpoint = FakeEndpoint(endpoint_type, self.region_name)
+        return self.endpoint
 
     def delete_thing(self, thing_name, expected_version):
         # TODO: handle expected_version
@@ -622,6 +677,11 @@ class IoTBackend(BaseBackend):
             self.region_name,
             ca_certificate_pem,
         )
+        self.certificates[certificate.certificate_id] = certificate
+        return certificate
+
+    def register_certificate_without_ca(self, certificate_pem, status):
+        certificate = FakeCertificate(certificate_pem, status, self.region_name)
         self.certificates[certificate.certificate_id] = certificate
         return certificate
 
@@ -805,6 +865,14 @@ class IoTBackend(BaseBackend):
         return thing_names
 
     def list_thing_principals(self, thing_name):
+
+        things = [_ for _ in self.things.values() if _.thing_name == thing_name]
+        if len(things) == 0:
+            raise ResourceNotFoundException(
+                "Failed to list principals for thing %s because the thing does not exist in your account"
+                % thing_name
+            )
+
         principals = [
             k[0] for k, v in self.principal_things.items() if k[1] == thing_name
         ]
@@ -834,12 +902,45 @@ class IoTBackend(BaseBackend):
         return thing_group.thing_group_name, thing_group.arn, thing_group.thing_group_id
 
     def delete_thing_group(self, thing_group_name, expected_version):
+        child_groups = [
+            thing_group
+            for _, thing_group in self.thing_groups.items()
+            if thing_group.parent_group_name == thing_group_name
+        ]
+        if len(child_groups) > 0:
+            raise InvalidRequestException(
+                " Cannot delete thing group : "
+                + thing_group_name
+                + " when there are still child groups attached to it"
+            )
         thing_group = self.describe_thing_group(thing_group_name)
         del self.thing_groups[thing_group.arn]
 
     def list_thing_groups(self, parent_group, name_prefix_filter, recursive):
-        thing_groups = self.thing_groups.values()
-        return thing_groups
+        if recursive is None:
+            recursive = True
+        if name_prefix_filter is None:
+            name_prefix_filter = ""
+        if parent_group and parent_group not in [
+            _.thing_group_name for _ in self.thing_groups.values()
+        ]:
+            raise ResourceNotFoundException()
+        thing_groups = [
+            _ for _ in self.thing_groups.values() if _.parent_group_name == parent_group
+        ]
+        if recursive:
+            for g in thing_groups:
+                thing_groups.extend(
+                    self.list_thing_groups(
+                        parent_group=g.thing_group_name,
+                        name_prefix_filter=None,
+                        recursive=False,
+                    )
+                )
+        # thing_groups = groups_to_process.values()
+        return [
+            _ for _ in thing_groups if _.thing_group_name.startswith(name_prefix_filter)
+        ]
 
     def update_thing_group(
         self, thing_group_name, thing_group_properties, expected_version

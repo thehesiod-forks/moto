@@ -18,6 +18,31 @@ from .exceptions import (
     ClientError,
 )
 from .utils import random_password, secret_arn, get_secret_name_from_arn
+from .list_secrets.filters import all, tag_key, tag_value, description, name
+
+
+_filter_functions = {
+    "all": all,
+    "name": name,
+    "description": description,
+    "tag-key": tag_key,
+    "tag-value": tag_value,
+}
+
+
+def filter_keys():
+    return list(_filter_functions.keys())
+
+
+def _matches(secret, filters):
+    is_match = True
+
+    for f in filters:
+        # Filter names are pre-validated in the resource layer
+        filter_function = _filter_functions.get(f["Key"])
+        is_match = is_match and filter_function(secret, f["Values"])
+
+    return is_match
 
 
 class SecretsManager(BaseModel):
@@ -37,6 +62,10 @@ class SecretsStore(dict):
     def __contains__(self, key):
         new_key = get_secret_name_from_arn(key)
         return dict.__contains__(self, new_key)
+
+    def pop(self, key, *args, **kwargs):
+        new_key = get_secret_name_from_arn(key)
+        return super(SecretsStore, self).pop(new_key, *args, **kwargs)
 
 
 class SecretsManagerBackend(BaseBackend):
@@ -107,8 +136,50 @@ class SecretsManagerBackend(BaseBackend):
 
         return response
 
+    def update_secret(
+        self, secret_id, secret_string=None, secret_binary=None, **kwargs
+    ):
+
+        # error if secret does not exist
+        if secret_id not in self.secrets.keys():
+            raise SecretNotFoundException()
+
+        if "deleted_date" in self.secrets[secret_id]:
+            raise InvalidRequestException(
+                "An error occurred (InvalidRequestException) when calling the UpdateSecret operation: "
+                "You can't perform this operation on the secret because it was marked for deletion."
+            )
+
+        secret = self.secrets[secret_id]
+        tags = secret["tags"]
+        description = secret["description"]
+
+        version_id = self._add_secret(
+            secret_id,
+            secret_string=secret_string,
+            secret_binary=secret_binary,
+            description=description,
+            tags=tags,
+        )
+
+        response = json.dumps(
+            {
+                "ARN": secret_arn(self.region, secret_id),
+                "Name": secret_id,
+                "VersionId": version_id,
+            }
+        )
+
+        return response
+
     def create_secret(
-        self, name, secret_string=None, secret_binary=None, tags=[], **kwargs
+        self,
+        name,
+        secret_string=None,
+        secret_binary=None,
+        description=None,
+        tags=[],
+        **kwargs
     ):
 
         # error if secret exists
@@ -118,7 +189,11 @@ class SecretsManagerBackend(BaseBackend):
             )
 
         version_id = self._add_secret(
-            name, secret_string=secret_string, secret_binary=secret_binary, tags=tags
+            name,
+            secret_string=secret_string,
+            secret_binary=secret_binary,
+            description=description,
+            tags=tags,
         )
 
         response = json.dumps(
@@ -136,6 +211,7 @@ class SecretsManagerBackend(BaseBackend):
         secret_id,
         secret_string=None,
         secret_binary=None,
+        description=None,
         tags=[],
         version_id=None,
         version_stages=None,
@@ -188,13 +264,27 @@ class SecretsManagerBackend(BaseBackend):
         secret["rotation_lambda_arn"] = ""
         secret["auto_rotate_after_days"] = 0
         secret["tags"] = tags
+        secret["description"] = description
 
         return version_id
 
     def put_secret_value(self, secret_id, secret_string, secret_binary, version_stages):
 
+        if secret_id in self.secrets.keys():
+            secret = self.secrets[secret_id]
+            tags = secret["tags"]
+            description = secret["description"]
+        else:
+            tags = []
+            description = ""
+
         version_id = self._add_secret(
-            secret_id, secret_string, secret_binary, version_stages=version_stages
+            secret_id,
+            secret_string,
+            secret_binary,
+            description=description,
+            tags=tags,
+            version_stages=version_stages,
         )
 
         response = json.dumps(
@@ -213,12 +303,13 @@ class SecretsManagerBackend(BaseBackend):
             raise SecretNotFoundException()
 
         secret = self.secrets[secret_id]
+        version_id_to_stages = self.form_version_ids_to_stages(secret["versions"])
 
         response = json.dumps(
             {
                 "ARN": secret_arn(self.region, secret["secret_id"]),
                 "Name": secret["name"],
-                "Description": "",
+                "Description": secret.get("description", ""),
                 "KmsKeyId": "",
                 "RotationEnabled": secret["rotation_enabled"],
                 "RotationLambdaARN": secret["rotation_lambda_arn"],
@@ -230,6 +321,7 @@ class SecretsManagerBackend(BaseBackend):
                 "LastAccessedDate": None,
                 "DeletedDate": secret.get("deleted_date", None),
                 "Tags": secret["tags"],
+                "VersionIdsToStages": version_id_to_stages,
             }
         )
 
@@ -282,6 +374,7 @@ class SecretsManagerBackend(BaseBackend):
         self._add_secret(
             secret_id,
             old_secret_version["secret_string"],
+            secret["description"],
             secret["tags"],
             version_id=new_version_id,
             version_stages=["AWSCURRENT"],
@@ -374,35 +467,35 @@ class SecretsManagerBackend(BaseBackend):
 
         return response
 
-    def list_secrets(self, max_results, next_token):
+    def list_secrets(self, filters, max_results, next_token):
         # TODO implement pagination and limits
 
         secret_list = []
         for secret in self.secrets.values():
+            if _matches(secret, filters):
+                versions_to_stages = {}
+                for version_id, version in secret["versions"].items():
+                    versions_to_stages[version_id] = version["version_stages"]
 
-            versions_to_stages = {}
-            for version_id, version in secret["versions"].items():
-                versions_to_stages[version_id] = version["version_stages"]
-
-            secret_list.append(
-                {
-                    "ARN": secret_arn(self.region, secret["secret_id"]),
-                    "DeletedDate": secret.get("deleted_date", None),
-                    "Description": "",
-                    "KmsKeyId": "",
-                    "LastAccessedDate": None,
-                    "LastChangedDate": None,
-                    "LastRotatedDate": None,
-                    "Name": secret["name"],
-                    "RotationEnabled": secret["rotation_enabled"],
-                    "RotationLambdaARN": secret["rotation_lambda_arn"],
-                    "RotationRules": {
-                        "AutomaticallyAfterDays": secret["auto_rotate_after_days"]
-                    },
-                    "SecretVersionsToStages": versions_to_stages,
-                    "Tags": secret["tags"],
-                }
-            )
+                secret_list.append(
+                    {
+                        "ARN": secret_arn(self.region, secret["secret_id"]),
+                        "DeletedDate": secret.get("deleted_date", None),
+                        "Description": secret.get("description", ""),
+                        "KmsKeyId": "",
+                        "LastAccessedDate": None,
+                        "LastChangedDate": None,
+                        "LastRotatedDate": None,
+                        "Name": secret["name"],
+                        "RotationEnabled": secret["rotation_enabled"],
+                        "RotationLambdaARN": secret["rotation_lambda_arn"],
+                        "RotationRules": {
+                            "AutomaticallyAfterDays": secret["auto_rotate_after_days"]
+                        },
+                        "SecretVersionsToStages": versions_to_stages,
+                        "Tags": secret["tags"],
+                    }
+                )
 
         return secret_list, None
 
@@ -489,6 +582,14 @@ class SecretsManagerBackend(BaseBackend):
                 "ResourcePolicy": json.dumps(resource_policy),
             }
         )
+
+    @staticmethod
+    def form_version_ids_to_stages(secret):
+        version_id_to_stages = {}
+        for key, value in secret.items():
+            version_id_to_stages[key] = value["version_stages"]
+
+        return version_id_to_stages
 
 
 secretsmanager_backends = {}

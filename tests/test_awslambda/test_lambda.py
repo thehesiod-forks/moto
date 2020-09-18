@@ -43,6 +43,7 @@ def _process_lambda(func_str):
 def get_test_zip_file1():
     pfunc = """
 def lambda_handler(event, context):
+    print("custom log event")
     return event
 """
     return _process_lambda(pfunc)
@@ -112,17 +113,28 @@ def test_invoke_requestresponse_function():
         FunctionName="testFunction",
         InvocationType="RequestResponse",
         Payload=json.dumps(in_data),
+        LogType="Tail",
     )
 
     success_result["StatusCode"].should.equal(200)
-    result_obj = json.loads(
-        base64.b64decode(success_result["LogResult"]).decode("utf-8")
-    )
+    logs = base64.b64decode(success_result["LogResult"]).decode("utf-8")
 
-    result_obj.should.equal(in_data)
+    logs.should.contain("START RequestId:")
+    logs.should.contain("custom log event")
+    logs.should.contain("END RequestId:")
 
     payload = success_result["Payload"].read().decode("utf-8")
     json.loads(payload).should.equal(in_data)
+
+    # Logs should not be returned by default, only when the LogType-param is supplied
+    success_result = conn.invoke(
+        FunctionName="testFunction",
+        InvocationType="RequestResponse",
+        Payload=json.dumps(in_data),
+    )
+
+    success_result["StatusCode"].should.equal(200)
+    assert "LogResult" not in success_result
 
 
 @mock_lambda
@@ -152,11 +164,6 @@ def test_invoke_requestresponse_function_with_arn():
     )
 
     success_result["StatusCode"].should.equal(200)
-    result_obj = json.loads(
-        base64.b64decode(success_result["LogResult"]).decode("utf-8")
-    )
-
-    result_obj.should.equal(in_data)
 
     payload = success_result["Payload"].read().decode("utf-8")
     json.loads(payload).should.equal(in_data)
@@ -482,7 +489,7 @@ def test_get_function():
         {"test_variable": "test_value"}
     )
 
-    # Test get function with
+    # Test get function with qualifier
     result = conn.get_function(FunctionName="testFunction", Qualifier="$LATEST")
     result["Configuration"]["Version"].should.equal("$LATEST")
     result["Configuration"]["FunctionArn"].should.equal(
@@ -1439,11 +1446,12 @@ def test_update_event_source_mapping():
     assert response["State"] == "Enabled"
 
     mapping = conn.update_event_source_mapping(
-        UUID=response["UUID"], Enabled=False, BatchSize=15, FunctionName="testFunction2"
+        UUID=response["UUID"], Enabled=False, BatchSize=2, FunctionName="testFunction2"
     )
     assert mapping["UUID"] == response["UUID"]
     assert mapping["FunctionArn"] == func2["FunctionArn"]
     assert mapping["State"] == "Disabled"
+    assert mapping["BatchSize"] == 2
 
 
 @mock_lambda
@@ -1655,7 +1663,7 @@ def test_update_function_s3():
 def test_create_function_with_invalid_arn():
     err = create_invalid_lambda("test-iam-role")
     err.exception.response["Error"]["Message"].should.equal(
-        "1 validation error detected: Value 'test-iam-role' at 'role' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:(aws[a-zA-Z-]*)?:iam::(\d{12}):role/?[a-zA-Z_0-9+=,.@\-_/]+"
+        r"1 validation error detected: Value 'test-iam-role' at 'role' failed to satisfy constraint: Member must satisfy regular expression pattern: arn:(aws[a-zA-Z-]*)?:iam::(\d{12}):role/?[a-zA-Z_0-9+=,.@\-_/]+"
     )
 
 
@@ -1675,6 +1683,118 @@ def test_create_function_with_unknown_arn():
     err.exception.response["Error"]["Message"].should.equal(
         "The role defined for the function cannot be assumed by Lambda."
     )
+
+
+@mock_lambda
+def test_remove_function_permission():
+    conn = boto3.client("lambda", _lambda_region)
+    zip_content = get_test_zip_file1()
+    conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=(get_role_name()),
+        Handler="lambda_function.handler",
+        Code={"ZipFile": zip_content},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+
+    conn.add_permission(
+        FunctionName="testFunction",
+        StatementId="1",
+        Action="lambda:InvokeFunction",
+        Principal="432143214321",
+        SourceArn="arn:aws:lambda:us-west-2:account-id:function:helloworld",
+        SourceAccount="123412341234",
+        EventSourceToken="blah",
+        Qualifier="2",
+    )
+
+    remove = conn.remove_permission(
+        FunctionName="testFunction", StatementId="1", Qualifier="2",
+    )
+    remove["ResponseMetadata"]["HTTPStatusCode"].should.equal(204)
+    policy = conn.get_policy(FunctionName="testFunction", Qualifier="2")["Policy"]
+    policy = json.loads(policy)
+    policy["Statement"].should.equal([])
+
+
+@mock_lambda
+def test_put_function_concurrency():
+    expected_concurrency = 15
+    function_name = "test"
+
+    conn = boto3.client("lambda", _lambda_region)
+    conn.create_function(
+        FunctionName=function_name,
+        Runtime="python3.8",
+        Role=(get_role_name()),
+        Handler="lambda_function.handler",
+        Code={"ZipFile": get_test_zip_file1()},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+    result = conn.put_function_concurrency(
+        FunctionName=function_name, ReservedConcurrentExecutions=expected_concurrency
+    )
+
+    result["ReservedConcurrentExecutions"].should.equal(expected_concurrency)
+
+
+@mock_lambda
+def test_delete_function_concurrency():
+    function_name = "test"
+
+    conn = boto3.client("lambda", _lambda_region)
+    conn.create_function(
+        FunctionName=function_name,
+        Runtime="python3.8",
+        Role=(get_role_name()),
+        Handler="lambda_function.handler",
+        Code={"ZipFile": get_test_zip_file1()},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+    conn.put_function_concurrency(
+        FunctionName=function_name, ReservedConcurrentExecutions=15
+    )
+
+    conn.delete_function_concurrency(FunctionName=function_name)
+    result = conn.get_function(FunctionName=function_name)
+
+    result.doesnt.have.key("Concurrency")
+
+
+@mock_lambda
+def test_get_function_concurrency():
+    expected_concurrency = 15
+    function_name = "test"
+
+    conn = boto3.client("lambda", _lambda_region)
+    conn.create_function(
+        FunctionName=function_name,
+        Runtime="python3.8",
+        Role=(get_role_name()),
+        Handler="lambda_function.handler",
+        Code={"ZipFile": get_test_zip_file1()},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+    conn.put_function_concurrency(
+        FunctionName=function_name, ReservedConcurrentExecutions=expected_concurrency
+    )
+
+    result = conn.get_function_concurrency(FunctionName=function_name)
+
+    result["ReservedConcurrentExecutions"].should.equal(expected_concurrency)
 
 
 def create_invalid_lambda(role):

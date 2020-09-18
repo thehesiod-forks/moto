@@ -10,9 +10,8 @@ import six
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
-import sshpubkeys.exceptions
-from sshpubkeys.keys import SSHKey
 
+from moto.iam.models import ACCOUNT_ID
 
 EC2_RESOURCE_TO_PREFIX = {
     "customer-gateway": "cgw",
@@ -183,33 +182,36 @@ def random_ip():
     )
 
 
+def randor_ipv4_cidr():
+    return "10.0.{}.{}/16".format(random.randint(0, 255), random.randint(0, 255))
+
+
 def random_ipv6_cidr():
     return "2400:6500:{}:{}::/56".format(random_resource_id(4), random_resource_id(4))
 
 
-def generate_route_id(route_table_id, cidr_block):
+def generate_route_id(route_table_id, cidr_block, ipv6_cidr_block=None):
+    if ipv6_cidr_block and not cidr_block:
+        cidr_block = ipv6_cidr_block
     return "%s~%s" % (route_table_id, cidr_block)
+
+
+def generate_vpc_end_point_id(vpc_id):
+    return "%s-%s" % ("vpce", vpc_id[4:])
+
+
+def create_dns_entries(service_name, vpc_endpoint_id):
+    dns_entries = {}
+    dns_entries["dns_name"] = "{}-{}.{}".format(
+        vpc_endpoint_id, random_resource_id(8), service_name
+    )
+    dns_entries["hosted_zone_id"] = random_resource_id(13).upper()
+    return dns_entries
 
 
 def split_route_id(route_id):
     values = route_id.split("~")
     return values[0], values[1]
-
-
-def tags_from_query_string(querystring_dict):
-    prefix = "Tag"
-    suffix = "Key"
-    response_values = {}
-    for key, value in querystring_dict.items():
-        if key.startswith(prefix) and key.endswith(suffix):
-            tag_index = key.replace(prefix + ".", "").replace("." + suffix, "")
-            tag_key = querystring_dict.get("Tag.{0}.Key".format(tag_index))[0]
-            tag_value_key = "Tag.{0}.Value".format(tag_index)
-            if tag_value_key in querystring_dict:
-                response_values[tag_key] = querystring_dict.get(tag_value_key)[0]
-            else:
-                response_values[tag_key] = None
-    return response_values
 
 
 def dhcp_configuration_from_querystring(querystring, option="DhcpConfiguration"):
@@ -290,7 +292,9 @@ def get_object_value(obj, attr):
     keys = attr.split(".")
     val = obj
     for key in keys:
-        if hasattr(val, key):
+        if key == "owner_id":
+            return ACCOUNT_ID
+        elif hasattr(val, key):
             val = getattr(val, key)
         elif isinstance(val, dict):
             val = val[key]
@@ -363,6 +367,7 @@ filter_dict_attribute_mapping = {
     "image-id": "image_id",
     "network-interface.private-dns-name": "private_dns",
     "private-dns-name": "private_dns",
+    "owner-id": "owner_id",
 }
 
 
@@ -560,6 +565,10 @@ def generate_instance_identity_document(instance):
 
 
 def rsa_public_key_parse(key_material):
+    # These imports take ~.5s; let's keep them local
+    import sshpubkeys.exceptions
+    from sshpubkeys.keys import SSHKey
+
     try:
         if not isinstance(key_material, six.binary_type):
             key_material = key_material.encode("ascii")

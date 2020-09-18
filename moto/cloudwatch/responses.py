@@ -93,6 +93,18 @@ class CloudWatchResponse(BaseResponse):
         return template.render()
 
     @amzn_request_id
+    def get_metric_data(self):
+        start = dtparse(self._get_param("StartTime"))
+        end = dtparse(self._get_param("EndTime"))
+        queries = self._get_list_prefix("MetricDataQueries.member")
+        results = self.cloudwatch_backend.get_metric_data(
+            start_time=start, end_time=end, queries=queries
+        )
+
+        template = self.response_template(GET_METRIC_DATA_TEMPLATE)
+        return template.render(results=results)
+
+    @amzn_request_id
     def get_metric_statistics(self):
         namespace = self._get_param("Namespace")
         metric_name = self._get_param("MetricName")
@@ -124,9 +136,10 @@ class CloudWatchResponse(BaseResponse):
     def list_metrics(self):
         namespace = self._get_param("Namespace")
         metric_name = self._get_param("MetricName")
+        dimensions = self._get_multi_param("Dimensions.member")
         next_token = self._get_param("NextToken")
         next_token, metrics = self.cloudwatch_backend.list_metrics(
-            next_token, namespace, metric_name
+            next_token, namespace, metric_name, dimensions
         )
         template = self.response_template(LIST_METRICS_TEMPLATE)
         return template.render(metrics=metrics, next_token=next_token)
@@ -148,9 +161,23 @@ class CloudWatchResponse(BaseResponse):
     def describe_alarm_history(self):
         raise NotImplementedError()
 
+    @staticmethod
+    def filter_alarms(alarms, metric_name, namespace):
+        metric_filtered_alarms = []
+
+        for alarm in alarms:
+            if alarm.metric_name == metric_name and alarm.namespace == namespace:
+                metric_filtered_alarms.append(alarm)
+        return metric_filtered_alarms
+
     @amzn_request_id
     def describe_alarms_for_metric(self):
-        raise NotImplementedError()
+        alarms = self.cloudwatch_backend.get_all_alarms()
+        namespace = self._get_param("Namespace")
+        metric_name = self._get_param("MetricName")
+        filtered_alarms = self.filter_alarms(alarms, metric_name, namespace)
+        template = self.response_template(DESCRIBE_METRIC_ALARMS_TEMPLATE)
+        return template.render(alarms=filtered_alarms)
 
     @amzn_request_id
     def disable_alarm_actions(self):
@@ -269,6 +296,57 @@ DESCRIBE_ALARMS_TEMPLATE = """<DescribeAlarmsResponse xmlns="http://monitoring.a
     </DescribeAlarmsResult>
 </DescribeAlarmsResponse>"""
 
+DESCRIBE_METRIC_ALARMS_TEMPLATE = """<DescribeAlarmsForMetricResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
+    <DescribeAlarmsForMetricResult>
+        <MetricAlarms>
+            {% for alarm in alarms %}
+            <member>
+                <ActionsEnabled>{{ alarm.actions_enabled }}</ActionsEnabled>
+                <AlarmActions>
+                    {% for action in alarm.alarm_actions %}
+                    <member>{{ action }}</member>
+                    {% endfor %}
+                </AlarmActions>
+                <AlarmArn>{{ alarm.arn }}</AlarmArn>
+                <AlarmConfigurationUpdatedTimestamp>{{ alarm.configuration_updated_timestamp }}</AlarmConfigurationUpdatedTimestamp>
+                <AlarmDescription>{{ alarm.description }}</AlarmDescription>
+                <AlarmName>{{ alarm.name }}</AlarmName>
+                <ComparisonOperator>{{ alarm.comparison_operator }}</ComparisonOperator>
+                <Dimensions>
+                    {% for dimension in alarm.dimensions %}
+                    <member>
+                        <Name>{{ dimension.name }}</Name>
+                        <Value>{{ dimension.value }}</Value>
+                    </member>
+                    {% endfor %}
+                </Dimensions>
+                <EvaluationPeriods>{{ alarm.evaluation_periods }}</EvaluationPeriods>
+                <InsufficientDataActions>
+                    {% for action in alarm.insufficient_data_actions %}
+                    <member>{{ action }}</member>
+                    {% endfor %}
+                </InsufficientDataActions>
+                <MetricName>{{ alarm.metric_name }}</MetricName>
+                <Namespace>{{ alarm.namespace }}</Namespace>
+                <OKActions>
+                    {% for action in alarm.ok_actions %}
+                    <member>{{ action }}</member>
+                    {% endfor %}
+                </OKActions>
+                <Period>{{ alarm.period }}</Period>
+                <StateReason>{{ alarm.state_reason }}</StateReason>
+                <StateReasonData>{{ alarm.state_reason_data }}</StateReasonData>
+                <StateUpdatedTimestamp>{{ alarm.state_updated_timestamp }}</StateUpdatedTimestamp>
+                <StateValue>{{ alarm.state_value }}</StateValue>
+                <Statistic>{{ alarm.statistic }}</Statistic>
+                <Threshold>{{ alarm.threshold }}</Threshold>
+                <Unit>{{ alarm.unit }}</Unit>
+            </member>
+            {% endfor %}
+        </MetricAlarms>
+    </DescribeAlarmsForMetricResult>
+</DescribeAlarmsForMetricResponse>"""
+
 DELETE_METRIC_ALARMS_TEMPLATE = """<DeleteMetricAlarmResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
    <ResponseMetadata>
       <RequestId>
@@ -284,6 +362,35 @@ PUT_METRIC_DATA_TEMPLATE = """<PutMetricDataResponse xmlns="http://monitoring.am
       </RequestId>
    </ResponseMetadata>
 </PutMetricDataResponse>"""
+
+GET_METRIC_DATA_TEMPLATE = """<GetMetricDataResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
+   <ResponseMetadata>
+      <RequestId>
+         {{ request_id }}
+      </RequestId>
+   </ResponseMetadata>
+   <GetMetricDataResult>
+       <MetricDataResults>
+           {% for result in results %}
+            <member>
+                <Id>{{ result.id }}</Id>
+                <Label>{{ result.label }}</Label>
+                <StatusCode>Complete</StatusCode>
+                <Timestamps>
+                    {% for val in result.timestamps %}
+                    <member>{{ val }}</member>
+                    {% endfor %}
+                </Timestamps>
+                <Values>
+                    {% for val in result.vals %}
+                    <member>{{ val }}</member>
+                    {% endfor %}
+                </Values>
+            </member>
+            {% endfor %}
+       </MetricDataResults>
+   </GetMetricDataResult>
+</GetMetricDataResponse>"""
 
 GET_METRIC_STATISTICS_TEMPLATE = """<GetMetricStatisticsResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
    <ResponseMetadata>

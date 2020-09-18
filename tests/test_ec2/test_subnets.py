@@ -76,6 +76,18 @@ def test_subnet_should_have_proper_availability_zone_set():
 
 
 @mock_ec2
+def test_availability_zone_in_create_subnet():
+    ec2 = boto3.resource("ec2", region_name="us-west-1")
+
+    vpc = ec2.create_vpc(CidrBlock="172.31.0.0/16")
+
+    subnet = ec2.create_subnet(
+        VpcId=vpc.id, CidrBlock="172.31.48.0/20", AvailabilityZoneId="use1-az6"
+    )
+    subnet.availability_zone_id.should.equal("use1-az6")
+
+
+@mock_ec2
 def test_default_subnet():
     ec2 = boto3.resource("ec2", region_name="us-west-1")
 
@@ -599,3 +611,28 @@ def validate_subnet_details_after_creating_eni(
     for eni in enis_created:
         client.delete_network_interface(NetworkInterfaceId=eni["NetworkInterfaceId"])
     client.delete_subnet(SubnetId=subnet["SubnetId"])
+
+
+@mock_ec2
+def test_run_instances_should_attach_to_default_subnet():
+    # https://github.com/spulec/moto/issues/2877
+    ec2 = boto3.resource("ec2", region_name="us-west-1")
+    client = boto3.client("ec2", region_name="us-west-1")
+    ec2.create_security_group(GroupName="sg01", Description="Test security group sg01")
+    # run_instances
+    instances = client.run_instances(MinCount=1, MaxCount=1, SecurityGroups=["sg01"],)
+    # Assert subnet is created appropriately
+    subnets = client.describe_subnets()["Subnets"]
+    default_subnet_id = subnets[0]["SubnetId"]
+    if len(subnets) > 1:
+        default_subnet_id1 = subnets[1]["SubnetId"]
+    assert (
+        instances["Instances"][0]["NetworkInterfaces"][0]["SubnetId"]
+        == default_subnet_id
+        or instances["Instances"][0]["NetworkInterfaces"][0]["SubnetId"]
+        == default_subnet_id1
+    )
+    assert (
+        subnets[0]["AvailableIpAddressCount"] == 4090
+        or subnets[1]["AvailableIpAddressCount"] == 4090
+    )

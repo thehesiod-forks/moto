@@ -88,6 +88,11 @@ class IoTResponse(BaseResponse):
         )
         return json.dumps(thing_type.to_dict())
 
+    def describe_endpoint(self):
+        endpoint_type = self._get_param("endpointType")
+        endpoint = self.iot_backend.describe_endpoint(endpoint_type=endpoint_type)
+        return json.dumps(endpoint.to_dict())
+
     def delete_thing(self):
         thing_name = self._get_param("thingName")
         expected_version = self._get_param("expectedVersion")
@@ -330,6 +335,17 @@ class IoTResponse(BaseResponse):
             dict(certificateId=cert.certificate_id, certificateArn=cert.arn)
         )
 
+    def register_certificate_without_ca(self):
+        certificate_pem = self._get_param("certificatePem")
+        status = self._get_param("status")
+
+        cert = self.iot_backend.register_certificate_without_ca(
+            certificate_pem=certificate_pem, status=status,
+        )
+        return json.dumps(
+            dict(certificateId=cert.certificate_id, certificateArn=cert.arn)
+        )
+
     def update_certificate(self):
         certificate_id = self._get_param("certificateId")
         new_status = self._get_param("newStatus")
@@ -535,7 +551,7 @@ class IoTResponse(BaseResponse):
         # max_results = self._get_int_param("maxResults")
         parent_group = self._get_param("parentGroup")
         name_prefix_filter = self._get_param("namePrefixFilter")
-        recursive = self._get_param("recursive")
+        recursive = self._get_bool_param("recursive")
         thing_groups = self.iot_backend.list_thing_groups(
             parent_group=parent_group,
             name_prefix_filter=name_prefix_filter,

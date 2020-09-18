@@ -6,6 +6,7 @@ from boto.s3.key import Key
 import re
 import six
 from six.moves.urllib.parse import urlparse, unquote, quote
+from requests.structures import CaseInsensitiveDict
 import sys
 
 
@@ -62,7 +63,7 @@ def parse_region_from_url(url):
 
 
 def metadata_from_headers(headers):
-    metadata = {}
+    metadata = CaseInsensitiveDict()
     meta_regex = re.compile(r"^x-amz-meta-([a-zA-Z0-9\-_]+)$", flags=re.IGNORECASE)
     for header, value in headers.items():
         if isinstance(header, six.string_types):
@@ -75,7 +76,11 @@ def metadata_from_headers(headers):
                 # Check for special metadata that doesn't start with x-amz-meta
                 meta_key = header
             if meta_key:
-                metadata[meta_key] = headers[header]
+                metadata[meta_key] = (
+                    headers[header][0]
+                    if type(headers[header]) == list
+                    else headers[header]
+                )
     return metadata
 
 
@@ -145,6 +150,12 @@ class _VersionedKeyStore(dict):
     def _iterlists(self):
         for key in self:
             yield key, self.getlist(key)
+
+    def item_size(self):
+        size = 0
+        for val in self.values():
+            size += sys.getsizeof(val)
+        return size
 
     items = iteritems = _iteritems
     lists = iterlists = _iterlists

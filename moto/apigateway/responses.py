@@ -6,11 +6,18 @@ from moto.core.responses import BaseResponse
 from .models import apigateway_backends
 from .exceptions import (
     ApiKeyNotFoundException,
+    UsagePlanNotFoundException,
     BadRequestException,
     CrossAccountNotAllowed,
     AuthorizerNotFoundException,
     StageNotFoundException,
     ApiKeyAlreadyExists,
+    DomainNameNotFound,
+    InvalidDomainName,
+    InvalidRestApiId,
+    InvalidModelName,
+    RestAPINotFound,
+    ModelNotFound,
 )
 
 API_KEY_SOURCES = ["AUTHORIZER", "HEADER"]
@@ -53,6 +60,7 @@ class APIGatewayResponse(BaseResponse):
             api_key_source = self._get_param("apiKeySource")
             endpoint_configuration = self._get_param("endpointConfiguration")
             tags = self._get_param("tags")
+            policy = self._get_param("policy")
 
             # Param validation
             if api_key_source and api_key_source not in API_KEY_SOURCES:
@@ -88,6 +96,7 @@ class APIGatewayResponse(BaseResponse):
                 api_key_source=api_key_source,
                 endpoint_configuration=endpoint_configuration,
                 tags=tags,
+                policy=policy,
             )
             return 200, {}, json.dumps(rest_api.to_dict())
 
@@ -378,6 +387,7 @@ class APIGatewayResponse(BaseResponse):
             elif self.method == "PUT":
                 selection_pattern = self._get_param("selectionPattern")
                 response_templates = self._get_param("responseTemplates")
+                content_handling = self._get_param("contentHandling")
                 integration_response = self.backend.create_integration_response(
                     function_id,
                     resource_id,
@@ -385,6 +395,7 @@ class APIGatewayResponse(BaseResponse):
                     status_code,
                     selection_pattern,
                     response_templates,
+                    content_handling,
                 )
             elif self.method == "DELETE":
                 integration_response = self.backend.delete_integration_response(
@@ -438,16 +449,15 @@ class APIGatewayResponse(BaseResponse):
             except ApiKeyAlreadyExists as error:
                 return (
                     error.code,
-                    self.headers,
+                    {},
                     '{{"message":"{0}","code":"{1}"}}'.format(
                         error.message, error.error_type
                     ),
                 )
-
+            return 201, {}, json.dumps(apikey_response)
         elif self.method == "GET":
             apikeys_response = self.backend.get_apikeys()
             return 200, {}, json.dumps({"item": apikeys_response})
-        return 200, {}, json.dumps(apikey_response)
 
     def apikey_individual(self, request, full_url, headers):
         self.setup_class(request, full_url, headers)
@@ -455,6 +465,7 @@ class APIGatewayResponse(BaseResponse):
         url_path_parts = self.path.split("/")
         apikey = url_path_parts[2]
 
+        status_code = 200
         if self.method == "GET":
             apikey_response = self.backend.get_apikey(apikey)
         elif self.method == "PATCH":
@@ -462,7 +473,9 @@ class APIGatewayResponse(BaseResponse):
             apikey_response = self.backend.update_apikey(apikey, patch_operations)
         elif self.method == "DELETE":
             apikey_response = self.backend.delete_apikey(apikey)
-        return 200, {}, json.dumps(apikey_response)
+            status_code = 202
+
+        return status_code, {}, json.dumps(apikey_response)
 
     def usage_plans(self, request, full_url, headers):
         self.setup_class(request, full_url, headers)
@@ -482,7 +495,16 @@ class APIGatewayResponse(BaseResponse):
         usage_plan = url_path_parts[2]
 
         if self.method == "GET":
-            usage_plan_response = self.backend.get_usage_plan(usage_plan)
+            try:
+                usage_plan_response = self.backend.get_usage_plan(usage_plan)
+            except (UsagePlanNotFoundException) as error:
+                return (
+                    error.code,
+                    {},
+                    '{{"message":"{0}","code":"{1}"}}'.format(
+                        error.message, error.error_type
+                    ),
+                )
         elif self.method == "DELETE":
             usage_plan_response = self.backend.delete_usage_plan(usage_plan)
         return 200, {}, json.dumps(usage_plan_response)
@@ -506,12 +528,10 @@ class APIGatewayResponse(BaseResponse):
                         error.message, error.error_type
                     ),
                 )
-
+            return 201, {}, json.dumps(usage_plan_response)
         elif self.method == "GET":
             usage_plans_response = self.backend.get_usage_plan_keys(usage_plan_id)
             return 200, {}, json.dumps({"item": usage_plans_response})
-
-        return 200, {}, json.dumps(usage_plan_response)
 
     def usage_plan_key_individual(self, request, full_url, headers):
         self.setup_class(request, full_url, headers)
@@ -521,9 +541,147 @@ class APIGatewayResponse(BaseResponse):
         key_id = url_path_parts[4]
 
         if self.method == "GET":
-            usage_plan_response = self.backend.get_usage_plan_key(usage_plan_id, key_id)
+            try:
+                usage_plan_response = self.backend.get_usage_plan_key(
+                    usage_plan_id, key_id
+                )
+            except (UsagePlanNotFoundException, ApiKeyNotFoundException) as error:
+                return (
+                    error.code,
+                    {},
+                    '{{"message":"{0}","code":"{1}"}}'.format(
+                        error.message, error.error_type
+                    ),
+                )
         elif self.method == "DELETE":
             usage_plan_response = self.backend.delete_usage_plan_key(
                 usage_plan_id, key_id
             )
         return 200, {}, json.dumps(usage_plan_response)
+
+    def domain_names(self, request, full_url, headers):
+        self.setup_class(request, full_url, headers)
+
+        try:
+            if self.method == "GET":
+                domain_names = self.backend.get_domain_names()
+                return 200, {}, json.dumps({"item": domain_names})
+
+            elif self.method == "POST":
+                domain_name = self._get_param("domainName")
+                certificate_name = self._get_param("certificateName")
+                tags = self._get_param("tags")
+                certificate_arn = self._get_param("certificateArn")
+                certificate_body = self._get_param("certificateBody")
+                certificate_private_key = self._get_param("certificatePrivateKey")
+                certificate_chain = self._get_param("certificateChain")
+                regional_certificate_name = self._get_param("regionalCertificateName")
+                regional_certificate_arn = self._get_param("regionalCertificateArn")
+                endpoint_configuration = self._get_param("endpointConfiguration")
+                security_policy = self._get_param("securityPolicy")
+                generate_cli_skeleton = self._get_param("generateCliSkeleton")
+                domain_name_resp = self.backend.create_domain_name(
+                    domain_name,
+                    certificate_name,
+                    tags,
+                    certificate_arn,
+                    certificate_body,
+                    certificate_private_key,
+                    certificate_chain,
+                    regional_certificate_name,
+                    regional_certificate_arn,
+                    endpoint_configuration,
+                    security_policy,
+                    generate_cli_skeleton,
+                )
+                return 200, {}, json.dumps(domain_name_resp)
+
+        except InvalidDomainName as error:
+            return (
+                error.code,
+                {},
+                '{{"message":"{0}","code":"{1}"}}'.format(
+                    error.message, error.error_type
+                ),
+            )
+
+    def domain_name_induvidual(self, request, full_url, headers):
+        self.setup_class(request, full_url, headers)
+
+        url_path_parts = self.path.split("/")
+        domain_name = url_path_parts[2]
+        domain_names = {}
+        try:
+            if self.method == "GET":
+                if domain_name is not None:
+                    domain_names = self.backend.get_domain_name(domain_name)
+            return 200, {}, json.dumps(domain_names)
+        except DomainNameNotFound as error:
+            return (
+                error.code,
+                {},
+                '{{"message":"{0}","code":"{1}"}}'.format(
+                    error.message, error.error_type
+                ),
+            )
+
+    def models(self, request, full_url, headers):
+        self.setup_class(request, full_url, headers)
+        rest_api_id = self.path.replace("/restapis/", "", 1).split("/")[0]
+
+        try:
+            if self.method == "GET":
+                models = self.backend.get_models(rest_api_id)
+                return 200, {}, json.dumps({"item": models})
+
+            elif self.method == "POST":
+                name = self._get_param("name")
+                description = self._get_param("description")
+                schema = self._get_param("schema")
+                content_type = self._get_param("contentType")
+                cli_input_json = self._get_param("cliInputJson")
+                generate_cli_skeleton = self._get_param("generateCliSkeleton")
+                model = self.backend.create_model(
+                    rest_api_id,
+                    name,
+                    content_type,
+                    description,
+                    schema,
+                    cli_input_json,
+                    generate_cli_skeleton,
+                )
+
+                return 200, {}, json.dumps(model)
+
+        except (InvalidRestApiId, InvalidModelName, RestAPINotFound) as error:
+            return (
+                error.code,
+                {},
+                '{{"message":"{0}","code":"{1}"}}'.format(
+                    error.message, error.error_type
+                ),
+            )
+
+    def model_induvidual(self, request, full_url, headers):
+        self.setup_class(request, full_url, headers)
+        url_path_parts = self.path.split("/")
+        rest_api_id = url_path_parts[2]
+        model_name = url_path_parts[4]
+        model_info = {}
+        try:
+            if self.method == "GET":
+                model_info = self.backend.get_model(rest_api_id, model_name)
+            return 200, {}, json.dumps(model_info)
+        except (
+            ModelNotFound,
+            RestAPINotFound,
+            InvalidRestApiId,
+            InvalidModelName,
+        ) as error:
+            return (
+                error.code,
+                {},
+                '{{"message":"{0}","code":"{1}"}}'.format(
+                    error.message, error.error_type
+                ),
+            )
