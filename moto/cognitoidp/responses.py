@@ -287,7 +287,7 @@ class CognitoIdpResponse(BaseResponse):
             user_pool_id, limit=limit, pagination_token=token
         )
         if filt:
-            name, value = filt.replace('"', "").split("=")
+            name, value = filt.replace('"', "").replace(" ", "").split("=")
             users = [
                 user
                 for user in users
@@ -446,6 +446,16 @@ class CognitoIdpResponse(BaseResponse):
         sms_mfa_settings = self._get_param("SMSMfaSettings")
         cognitoidp_backends[self.region].set_user_mfa_preference(
             access_token, software_token_mfa_settings, sms_mfa_settings
+        )
+        return ""
+
+    def admin_set_user_password(self):
+        user_pool_id = self._get_param("UserPoolId")
+        username = self._get_param("Username")
+        password = self._get_param("Password")
+        permanent = self._get_param("Permanent")
+        cognitoidp_backends[self.region].admin_set_user_password(
+            user_pool_id, username, password, permanent
         )
         return ""
 

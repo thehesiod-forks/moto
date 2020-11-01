@@ -826,7 +826,7 @@ class DynamoHandler(BaseResponse):
                         original.get(key, None), changed[key]
                     )
                     for key in changed.keys()
-                    if changed[key] != original.get(key, None)
+                    if key not in original or changed[key] != original[key]
                 }
             elif type(changed) in (set, list):
                 if len(changed) != len(original):
@@ -906,6 +906,7 @@ class DynamoHandler(BaseResponse):
                 return self.error(er, "Requested resource not found")
 
             if not item:
+                responses.append({})
                 continue
 
             item_describe = item.describe_attrs(False)

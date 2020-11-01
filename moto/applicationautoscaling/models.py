@@ -5,6 +5,7 @@ from .exceptions import AWSValidationException
 from collections import OrderedDict
 from enum import Enum, unique
 import time
+import uuid
 
 
 @unique
@@ -58,6 +59,7 @@ class ApplicationAutoscalingBackend(BaseBackend):
         self.region = region
         self.ecs_backend = ecs
         self.targets = OrderedDict()
+        self.policies = {}
 
     def reset(self):
         region = self.region
@@ -98,7 +100,7 @@ class ApplicationAutoscalingBackend(BaseBackend):
             _ = self._ecs_service_exists_for_target(r_id)
         if self._scalable_target_exists(r_id, dimension):
             target = self.targets[dimension][r_id]
-            target.update(kwargs)
+            target.update(**kwargs)
         else:
             target = FakeScalableTarget(self, namespace, r_id, dimension, **kwargs)
             self._add_scalable_target(target)
@@ -124,6 +126,100 @@ class ApplicationAutoscalingBackend(BaseBackend):
             self.targets[target.scalable_dimension][target.resource_id] = target
         return target
 
+    def deregister_scalable_target(self, namespace, r_id, dimension):
+        """ Registers or updates a scalable target. """
+        if self._scalable_target_exists(r_id, dimension):
+            del self.targets[dimension][r_id]
+        else:
+            raise AWSValidationException(
+                "No scalable target found for service namespace: {}, resource ID: {}, scalable dimension: {}".format(
+                    namespace, r_id, dimension
+                )
+            )
+
+    def put_scaling_policy(
+        self,
+        policy_name,
+        service_namespace,
+        resource_id,
+        scalable_dimension,
+        policy_body,
+        policy_type=None,
+    ):
+        policy_key = FakeApplicationAutoscalingPolicy.formulate_key(
+            service_namespace, resource_id, scalable_dimension, policy_name
+        )
+        if policy_key in self.policies:
+            old_policy = self.policies[policy_name]
+            policy = FakeApplicationAutoscalingPolicy(
+                region_name=self.region,
+                policy_name=policy_name,
+                service_namespace=service_namespace,
+                resource_id=resource_id,
+                scalable_dimension=scalable_dimension,
+                policy_type=policy_type if policy_type else old_policy.policy_type,
+                policy_body=policy_body if policy_body else old_policy._policy_body,
+            )
+        else:
+            policy = FakeApplicationAutoscalingPolicy(
+                region_name=self.region,
+                policy_name=policy_name,
+                service_namespace=service_namespace,
+                resource_id=resource_id,
+                scalable_dimension=scalable_dimension,
+                policy_type=policy_type,
+                policy_body=policy_body,
+            )
+        self.policies[policy_key] = policy
+        return policy
+
+    def describe_scaling_policies(self, service_namespace, **kwargs):
+        policy_names = kwargs.get("policy_names")
+        resource_id = kwargs.get("resource_id")
+        scalable_dimension = kwargs.get("scalable_dimension")
+        max_results = kwargs.get("max_results") or 100
+        next_token = kwargs.get("next_token")
+        policies = [
+            policy
+            for policy in self.policies.values()
+            if policy.service_namespace == service_namespace
+        ]
+        if policy_names:
+            policies = [
+                policy for policy in policies if policy.policy_name in policy_names
+            ]
+        if resource_id:
+            policies = [
+                policy for policy in policies if policy.resource_id in resource_id
+            ]
+        if scalable_dimension:
+            policies = [
+                policy
+                for policy in policies
+                if policy.scalable_dimension in scalable_dimension
+            ]
+        starting_point = int(next_token) if next_token else 0
+        ending_point = starting_point + max_results
+        policies_page = policies[starting_point:ending_point]
+        new_next_token = str(ending_point) if ending_point < len(policies) else None
+        return new_next_token, policies_page
+
+    def delete_scaling_policy(
+        self, policy_name, service_namespace, resource_id, scalable_dimension
+    ):
+        policy_key = FakeApplicationAutoscalingPolicy.formulate_key(
+            service_namespace, resource_id, scalable_dimension, policy_name
+        )
+        if policy_key in self.policies:
+            del self.policies[policy_key]
+            return {}
+        else:
+            raise AWSValidationException(
+                "No scaling policy found for service namespace: {}, resource ID: {}, scalable dimension: {}, policy name: {}".format(
+                    service_namespace, resource_id, scalable_dimension, policy_name
+                )
+            )
+
 
 def _target_params_are_valid(namespace, r_id, dimension):
     """ Check whether namespace, resource_id and dimension are valid and consistent with each other. """
@@ -135,7 +231,7 @@ def _target_params_are_valid(namespace, r_id, dimension):
         try:
             valid_dimensions = [d.value for d in ScalableDimensionValueSet]
             d_namespace, d_resource_type, scaling_property = dimension.split(":")
-            resource_type, cluster, service = r_id.split("/")
+            resource_type = _get_resource_type_from_resource_id(r_id)
             if (
                 dimension not in valid_dimensions
                 or d_namespace != namespace
@@ -149,6 +245,33 @@ def _target_params_are_valid(namespace, r_id, dimension):
             "Unsupported service namespace, resource type or scalable dimension"
         )
     return is_valid
+
+
+def _get_resource_type_from_resource_id(resource_id):
+    # AWS Application Autoscaling resource_ids are multi-component (path-like) identifiers that vary in format,
+    # depending on the type of resource it identifies.  resource_type is one of its components.
+    #  resource_id format variations are described in
+    #   https://docs.aws.amazon.com/autoscaling/application/APIReference/API_RegisterScalableTarget.html
+    #  In a nutshell:
+    #  - Most use slash separators, but some use colon separators.
+    #  - The resource type is usually the first component of the resource_id...
+    #    - ...except for sagemaker endpoints, dynamodb GSIs and keyspaces tables, where it's the third.
+    #  - Comprehend uses an arn, with the resource type being the last element.
+
+    if resource_id.startswith("arn:aws:comprehend"):
+        resource_id = resource_id.split(":")[-1]
+    resource_split = (
+        resource_id.split("/") if "/" in resource_id else resource_id.split(":")
+    )
+    if (
+        resource_split[0] == "endpoint"
+        or (resource_split[0] == "table" and len(resource_split) > 2)
+        or (resource_split[0] == "keyspace")
+    ):
+        resource_type = resource_split[2]
+    else:
+        resource_type = resource_split[0]
+    return resource_type
 
 
 class FakeScalableTarget(BaseModel):
@@ -170,6 +293,52 @@ class FakeScalableTarget(BaseModel):
             self.min_capacity = kwargs["min_capacity"]
         if kwargs["max_capacity"] is not None:
             self.max_capacity = kwargs["max_capacity"]
+        if kwargs["suspended_state"] is not None:
+            self.suspended_state = kwargs["suspended_state"]
+
+
+class FakeApplicationAutoscalingPolicy(BaseModel):
+    def __init__(
+        self,
+        region_name,
+        policy_name,
+        service_namespace,
+        resource_id,
+        scalable_dimension,
+        policy_type,
+        policy_body,
+    ):
+        self.step_scaling_policy_configuration = None
+        self.target_tracking_scaling_policy_configuration = None
+
+        if "policy_type" == "StepScaling":
+            self.step_scaling_policy_configuration = policy_body
+            self.target_tracking_scaling_policy_configuration = None
+        elif policy_type == "TargetTrackingScaling":
+            self.step_scaling_policy_configuration = None
+            self.target_tracking_scaling_policy_configuration = policy_body
+        else:
+            raise AWSValidationException(
+                "Unknown policy type {} specified.".format(policy_type)
+            )
+
+        self._policy_body = policy_body
+        self.service_namespace = service_namespace
+        self.resource_id = resource_id
+        self.scalable_dimension = scalable_dimension
+        self.policy_name = policy_name
+        self.policy_type = policy_type
+        self._guid = uuid.uuid4()
+        self.policy_arn = "arn:aws:autoscaling:{}:scalingPolicy:{}:resource/sagemaker/{}:policyName/{}".format(
+            region_name, self._guid, self.resource_id, self.policy_name
+        )
+        self.creation_time = time.time()
+
+    @staticmethod
+    def formulate_key(service_namespace, resource_id, scalable_dimension, policy_name):
+        return "{}\t{}\t{}\t{}".format(
+            service_namespace, resource_id, scalable_dimension, policy_name
+        )
 
 
 applicationautoscaling_backends = {}

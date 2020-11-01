@@ -11,11 +11,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from moto.iam.models import ACCOUNT_ID
+from moto.core import ACCOUNT_ID
 
 EC2_RESOURCE_TO_PREFIX = {
     "customer-gateway": "cgw",
     "dhcp-options": "dopt",
+    "flow-logs": "fl",
     "image": "ami",
     "instance": "i",
     "internet-gateway": "igw",
@@ -72,6 +73,10 @@ def random_reservation_id():
 
 def random_security_group_id():
     return random_id(prefix=EC2_RESOURCE_TO_PREFIX["security-group"])
+
+
+def random_flow_log_id():
+    return random_id(prefix=EC2_RESOURCE_TO_PREFIX["flow-logs"])
 
 
 def random_snapshot_id():

@@ -3,7 +3,6 @@ from __future__ import unicode_literals
 
 import base64
 import json
-import os
 import time
 import uuid
 
@@ -17,33 +16,17 @@ from boto.exception import SQSError
 from boto.sqs.message import Message, RawMessage
 from botocore.exceptions import ClientError
 from freezegun import freeze_time
-from moto import mock_sqs, mock_sqs_deprecated, mock_cloudformation, settings
+from moto import mock_sqs, mock_sqs_deprecated, mock_lambda, mock_logs, settings
 from nose import SkipTest
 from nose.tools import assert_raises
 from tests.helpers import requires_boto_gte
+from tests.test_awslambda.test_lambda import get_test_zip_file1, get_role_name
 from moto.core import ACCOUNT_ID
-
-sqs_template_with_tags = """
-{
-    "AWSTemplateFormatVersion": "2010-09-09",
-    "Resources": {
-        "SQSQueue": {
-            "Type": "AWS::SQS::Queue",
-            "Properties": {
-                "Tags" : [
-                    {
-                        "Key" : "keyname1",
-                        "Value" : "value1"
-                    },
-                    {
-                        "Key" : "keyname2",
-                        "Value" : "value2"
-                    }
-                ]
-            }
-        }
-    }
-}"""
+from moto.sqs.models import (
+    MAXIMUM_MESSAGE_SIZE_ATTR_LOWER_BOUND,
+    MAXIMUM_MESSAGE_SIZE_ATTR_UPPER_BOUND,
+    MAXIMUM_MESSAGE_LENGTH,
+)
 
 TEST_POLICY = """
 {
@@ -110,6 +93,18 @@ def test_create_queue_with_different_attributes_fail():
         err.response["Error"]["Code"].should.equal("QueueAlreadyExists")
     else:
         raise RuntimeError("Should of raised QueueAlreadyExists Exception")
+
+    response = sqs.create_queue(
+        QueueName="test-queue1", Attributes={"FifoQueue": "True"}
+    )
+
+    attributes = {"VisibilityTimeout": "60"}
+    sqs.set_queue_attributes(QueueUrl=response.get("QueueUrl"), Attributes=attributes)
+
+    new_response = sqs.create_queue(
+        QueueName="test-queue1", Attributes={"FifoQueue": "True"}
+    )
+    new_response["QueueUrl"].should.equal(response.get("QueueUrl"))
 
 
 @mock_sqs
@@ -261,11 +256,14 @@ def test_message_send_with_attributes():
     msg = queue.send_message(
         MessageBody="derp",
         MessageAttributes={
-            "timestamp": {"StringValue": "1493147359900", "DataType": "Number"}
+            "SOME_Valid.attribute-Name": {
+                "StringValue": "1493147359900",
+                "DataType": "Number",
+            }
         },
     )
     msg.get("MD5OfMessageBody").should.equal("58fd9edd83341c29f1aebba81c31e257")
-    msg.get("MD5OfMessageAttributes").should.equal("235c5c510d26fb653d073faed50ae77c")
+    msg.get("MD5OfMessageAttributes").should.equal("36655e7e9d7c0e8479fa3f3f42247ae7")
     msg.get("MessageId").should_not.contain(" \n")
 
     messages = queue.receive_messages()
@@ -273,20 +271,71 @@ def test_message_send_with_attributes():
 
 
 @mock_sqs
-def test_message_with_complex_attributes():
+def test_message_with_invalid_attributes():
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    queue = sqs.create_queue(QueueName="blah")
+    with assert_raises(ClientError) as e:
+        queue.send_message(
+            MessageBody="derp",
+            MessageAttributes={
+                "öther_encodings": {"DataType": "String", "StringValue": "str"},
+            },
+        )
+    ex = e.exception
+    ex.response["Error"]["Code"].should.equal("MessageAttributesInvalid")
+    ex.response["Error"]["Message"].should.equal(
+        "The message attribute name 'öther_encodings' is invalid. "
+        "Attribute name can contain A-Z, a-z, 0-9, underscore (_), hyphen (-), and period (.) characters."
+    )
+
+
+@mock_sqs
+def test_message_with_string_attributes():
     sqs = boto3.resource("sqs", region_name="us-east-1")
     queue = sqs.create_queue(QueueName="blah")
     msg = queue.send_message(
         MessageBody="derp",
         MessageAttributes={
-            "ccc": {"StringValue": "testjunk", "DataType": "String"},
-            "aaa": {"BinaryValue": b"\x02\x03\x04", "DataType": "Binary"},
-            "zzz": {"DataType": "Number", "StringValue": "0230.01"},
-            "öther_encodings": {"DataType": "String", "StringValue": "T\xFCst"},
+            "id": {
+                "StringValue": "2018fc74-4f77-1a5a-1be0-c2d037d5052b",
+                "DataType": "String",
+            },
+            "contentType": {"StringValue": "application/json", "DataType": "String"},
+            "timestamp": {
+                "StringValue": "1602845432024",
+                "DataType": "Number.java.lang.Long",
+            },
         },
     )
     msg.get("MD5OfMessageBody").should.equal("58fd9edd83341c29f1aebba81c31e257")
-    msg.get("MD5OfMessageAttributes").should.equal("8ae21a7957029ef04146b42aeaa18a22")
+    msg.get("MD5OfMessageAttributes").should.equal("b12289320bb6e494b18b645ef562b4a9")
+    msg.get("MessageId").should_not.contain(" \n")
+
+    messages = queue.receive_messages()
+    messages.should.have.length_of(1)
+
+
+@mock_sqs
+def test_message_with_binary_attribute():
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    queue = sqs.create_queue(QueueName="blah")
+    msg = queue.send_message(
+        MessageBody="derp",
+        MessageAttributes={
+            "id": {
+                "StringValue": "453ae55e-f03b-21a6-a4b1-70c2e2e8fe71",
+                "DataType": "String",
+            },
+            "mybin": {"BinaryValue": "kekchebukek", "DataType": "Binary"},
+            "timestamp": {
+                "StringValue": "1603134247654",
+                "DataType": "Number.java.lang.Long",
+            },
+            "contentType": {"StringValue": "application/json", "DataType": "String"},
+        },
+    )
+    msg.get("MD5OfMessageBody").should.equal("58fd9edd83341c29f1aebba81c31e257")
+    msg.get("MD5OfMessageAttributes").should.equal("049075255ebc53fb95f7f9f3cedf3c50")
     msg.get("MessageId").should_not.contain(" \n")
 
     messages = queue.receive_messages()
@@ -307,7 +356,7 @@ def test_message_with_attributes_have_labels():
         },
     )
     msg.get("MD5OfMessageBody").should.equal("58fd9edd83341c29f1aebba81c31e257")
-    msg.get("MD5OfMessageAttributes").should.equal("235c5c510d26fb653d073faed50ae77c")
+    msg.get("MD5OfMessageAttributes").should.equal("2e2e4876d8e0bd6b8c2c8f556831c349")
     msg.get("MessageId").should_not.contain(" \n")
 
     messages = queue.receive_messages()
@@ -603,9 +652,9 @@ def test_send_receive_message_with_attributes():
         },
     )
 
-    messages = conn.receive_message(QueueUrl=queue.url, MaxNumberOfMessages=2)[
-        "Messages"
-    ]
+    messages = conn.receive_message(
+        QueueUrl=queue.url, MaxNumberOfMessages=2, MessageAttributeNames=["timestamp"]
+    )["Messages"]
 
     message1 = messages[0]
     message2 = messages[1]
@@ -651,9 +700,9 @@ def test_send_receive_message_with_attributes_with_labels():
         },
     )
 
-    messages = conn.receive_message(QueueUrl=queue.url, MaxNumberOfMessages=2)[
-        "Messages"
-    ]
+    messages = conn.receive_message(
+        QueueUrl=queue.url, MaxNumberOfMessages=2, MessageAttributeNames=["timestamp"]
+    )["Messages"]
 
     message1 = messages[0]
     message2 = messages[1]
@@ -662,10 +711,21 @@ def test_send_receive_message_with_attributes_with_labels():
     message2.get("Body").should.equal(body_two)
 
     message1.get("MD5OfMessageAttributes").should.equal(
-        "235c5c510d26fb653d073faed50ae77c"
+        "2e2e4876d8e0bd6b8c2c8f556831c349"
     )
     message2.get("MD5OfMessageAttributes").should.equal(
-        "994258b45346a2cc3f9cbb611aa7af30"
+        "cfa7c73063c6e2dbf9be34232a1978cf"
+    )
+
+    response = queue.send_message(
+        MessageBody="test message",
+        MessageAttributes={
+            "somevalue": {"StringValue": "somevalue", "DataType": "String.custom",}
+        },
+    )
+
+    response.get("MD5OfMessageAttributes").should.equal(
+        "9e05cca738e70ff6c6041e82d5e77ef1"
     )
 
 
@@ -778,7 +838,14 @@ def test_send_message_with_attributes():
 
     queue.write(message)
 
-    messages = conn.receive_message(queue)
+    messages = conn.receive_message(
+        queue,
+        message_attributes=[
+            "test.attribute_name",
+            "test.binary_attribute",
+            "test.number_attribute",
+        ],
+    )
 
     messages[0].get_body().should.equal(body)
 
@@ -998,7 +1065,7 @@ def test_send_batch_operation_with_message_attributes():
     )
     queue.write_batch([message_tuple])
 
-    messages = queue.get_messages()
+    messages = queue.get_messages(message_attributes=["name1"])
     messages[0].get_body().should.equal("test message 1")
 
     for name, value in message_tuple[3].items():
@@ -1233,7 +1300,11 @@ def test_send_message_batch():
         ["id_1", "id_2"]
     )
 
-    response = client.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+    response = client.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=10,
+        MessageAttributeNames=["attribute_name_1", "attribute_name_2"],
+    )
 
     response["Messages"][0]["Body"].should.equal("body_1")
     response["Messages"][0]["MessageAttributes"].should.equal(
@@ -1254,6 +1325,75 @@ def test_send_message_batch():
     )
     response["Messages"][1]["Attributes"]["MessageDeduplicationId"].should.equal(
         "message_deduplication_id_2"
+    )
+
+
+@mock_sqs
+def test_message_attributes_in_receive_message():
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    conn = boto3.client("sqs", region_name="us-east-1")
+    conn.create_queue(QueueName="test-queue")
+    queue = sqs.Queue("test-queue")
+
+    body_one = "this is a test message"
+
+    queue.send_message(
+        MessageBody=body_one,
+        MessageAttributes={
+            "timestamp": {
+                "StringValue": "1493147359900",
+                "DataType": "Number.java.lang.Long",
+            }
+        },
+    )
+    messages = conn.receive_message(
+        QueueUrl=queue.url, MaxNumberOfMessages=2, MessageAttributeNames=["timestamp"]
+    )["Messages"]
+
+    messages[0]["MessageAttributes"].should.equal(
+        {
+            "timestamp": {
+                "StringValue": "1493147359900",
+                "DataType": "Number.java.lang.Long",
+            }
+        }
+    )
+
+    queue.send_message(
+        MessageBody=body_one,
+        MessageAttributes={
+            "timestamp": {
+                "StringValue": "1493147359900",
+                "DataType": "Number.java.lang.Long",
+            }
+        },
+    )
+    messages = conn.receive_message(QueueUrl=queue.url, MaxNumberOfMessages=2)[
+        "Messages"
+    ]
+
+    messages[0].get("MessageAttributes").should.equal(None)
+
+    queue.send_message(
+        MessageBody=body_one,
+        MessageAttributes={
+            "timestamp": {
+                "StringValue": "1493147359900",
+                "DataType": "Number.java.lang.Long",
+            }
+        },
+    )
+    messages = conn.receive_message(
+        QueueUrl=queue.url, MaxNumberOfMessages=2, MessageAttributeNames=["All"]
+    )["Messages"]
+
+    messages[0]["MessageAttributes"].should.equal(
+        {
+            "timestamp": {
+                "StringValue": "1493147359900",
+                "DataType": "Number.java.lang.Long",
+            }
+        }
     )
 
 
@@ -2042,15 +2182,105 @@ def test_send_messages_to_fifo_without_message_group_id():
     )
 
 
+@mock_logs
+@mock_lambda
 @mock_sqs
-@mock_cloudformation
-def test_create_from_cloudformation_json_with_tags():
-    cf = boto3.client("cloudformation", region_name="us-east-1")
-    client = boto3.client("sqs", region_name="us-east-1")
+def test_invoke_function_from_sqs_exception():
+    logs_conn = boto3.client("logs", region_name="us-east-1")
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    queue = sqs.create_queue(QueueName="test-sqs-queue1")
 
-    cf.create_stack(StackName="test-sqs", TemplateBody=sqs_template_with_tags)
+    conn = boto3.client("lambda", region_name="us-east-1")
+    func = conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=get_role_name(),
+        Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": get_test_zip_file1()},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
 
-    queue_url = client.list_queues()["QueueUrls"][0]
+    response = conn.create_event_source_mapping(
+        EventSourceArn=queue.attributes["QueueArn"], FunctionName=func["FunctionArn"]
+    )
 
-    queue_tags = client.list_queue_tags(QueueUrl=queue_url)["Tags"]
-    queue_tags.should.equal({"keyname1": "value1", "keyname2": "value2"})
+    assert response["EventSourceArn"] == queue.attributes["QueueArn"]
+    assert response["State"] == "Enabled"
+
+    entries = [
+        {
+            "Id": "1",
+            "MessageBody": json.dumps({"uuid": str(uuid.uuid4()), "test": "test"}),
+        }
+    ]
+
+    queue.send_messages(Entries=entries)
+
+    start = time.time()
+    while (time.time() - start) < 30:
+        result = logs_conn.describe_log_streams(logGroupName="/aws/lambda/testFunction")
+        log_streams = result.get("logStreams")
+        if not log_streams:
+            time.sleep(1)
+            continue
+        assert len(log_streams) >= 1
+
+        result = logs_conn.get_log_events(
+            logGroupName="/aws/lambda/testFunction",
+            logStreamName=log_streams[0]["logStreamName"],
+        )
+        for event in result.get("events"):
+            if "custom log event" in event["message"]:
+                return
+        time.sleep(1)
+
+    assert False, "Test Failed"
+
+
+@mock_sqs
+def test_maximum_message_size_attribute_default():
+    sqs = boto3.resource("sqs", region_name="eu-west-3")
+    queue = sqs.create_queue(QueueName="test-queue",)
+    int(queue.attributes["MaximumMessageSize"]).should.equal(MAXIMUM_MESSAGE_LENGTH)
+    with assert_raises(Exception) as e:
+        queue.send_message(MessageBody="a" * (MAXIMUM_MESSAGE_LENGTH + 1))
+    ex = e.exception
+    ex.response["Error"]["Code"].should.equal("InvalidParameterValue")
+
+
+@mock_sqs
+def test_maximum_message_size_attribute_fails_for_invalid_values():
+    sqs = boto3.resource("sqs", region_name="eu-west-3")
+    invalid_values = [
+        MAXIMUM_MESSAGE_SIZE_ATTR_LOWER_BOUND - 1,
+        MAXIMUM_MESSAGE_SIZE_ATTR_UPPER_BOUND + 1,
+    ]
+    for message_size in invalid_values:
+        with assert_raises(ClientError) as e:
+            sqs.create_queue(
+                QueueName="test-queue",
+                Attributes={"MaximumMessageSize": str(message_size)},
+            )
+        ex = e.exception
+        ex.response["Error"]["Code"].should.equal("InvalidAttributeValue")
+
+
+@mock_sqs
+def test_send_message_fails_when_message_size_greater_than_max_message_size():
+    sqs = boto3.resource("sqs", region_name="eu-west-3")
+    message_size_limit = 12345
+    queue = sqs.create_queue(
+        QueueName="test-queue",
+        Attributes={"MaximumMessageSize": str(message_size_limit)},
+    )
+    int(queue.attributes["MaximumMessageSize"]).should.equal(message_size_limit)
+    with assert_raises(ClientError) as e:
+        queue.send_message(MessageBody="a" * (message_size_limit + 1))
+    ex = e.exception
+    ex.response["Error"]["Code"].should.equal("InvalidParameterValue")
+    ex.response["Error"]["Message"].should.contain(
+        "{} bytes".format(message_size_limit)
+    )

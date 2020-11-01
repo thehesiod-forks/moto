@@ -37,6 +37,7 @@ from .exceptions import (
     ObjectNotInActiveTierError,
     NoSystemTags,
     PreconditionFailed,
+    InvalidRange,
 )
 from .models import (
     s3_backend,
@@ -936,11 +937,15 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         else:
             return 400, response_headers, ""
         if begin < 0 or end > last or begin > min(end, last):
-            return 416, response_headers, ""
+            raise InvalidRange(
+                actual_size=str(length), range_requested=request.headers.get("range")
+            )
         response_headers["content-range"] = "bytes {0}-{1}/{2}".format(
             begin, end, length
         )
-        return 206, response_headers, response_content[begin : end + 1]
+        content = response_content[begin : end + 1]
+        response_headers["content-length"] = len(content)
+        return 206, response_headers, content
 
     def key_or_control_response(self, request, full_url, headers):
         # Key and Control are lumped in because splitting out the regex is too much of a pain :/
@@ -967,9 +972,12 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             status_code, response_headers, response_content = response
 
         if status_code == 200 and "range" in request.headers:
-            return self._handle_range_header(
-                request, response_headers, response_content
-            )
+            try:
+                return self._handle_range_header(
+                    request, response_headers, response_content
+                )
+            except S3ClientError as s3error:
+                return s3error.code, {}, s3error.description
         return status_code, response_headers, response_content
 
     def _control_response(self, request, full_url, headers):
@@ -1276,7 +1284,13 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
             if key is not None:
                 if key.storage_class in ["GLACIER", "DEEP_ARCHIVE"]:
-                    raise ObjectNotInActiveTierError(key)
+                    if key.response_dict.get(
+                        "x-amz-restore"
+                    ) is None or 'ongoing-request="true"' in key.response_dict.get(
+                        "x-amz-restore"
+                    ):
+                        raise ObjectNotInActiveTierError(key)
+
                 self.backend.copy_key(
                     src_bucket,
                     src_key,
@@ -1755,7 +1769,7 @@ S3_ALL_BUCKETS = """<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2
     {% for bucket in buckets %}
       <Bucket>
         <Name>{{ bucket.name }}</Name>
-        <CreationDate>{{ bucket.creation_date.isoformat() }}</CreationDate>
+        <CreationDate>{{ bucket.creation_date_ISO8601 }}</CreationDate>
       </Bucket>
     {% endfor %}
  </Buckets>
@@ -1768,7 +1782,9 @@ S3_BUCKET_GET_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
   <Prefix>{{ prefix }}</Prefix>
   {% endif %}
   <MaxKeys>{{ max_keys }}</MaxKeys>
-  <Delimiter>{{ delimiter }}</Delimiter>
+  {% if delimiter %}
+    <Delimiter>{{ delimiter }}</Delimiter>
+  {% endif %}
   <IsTruncated>{{ is_truncated }}</IsTruncated>
   {% if next_marker %}
     <NextMarker>{{ next_marker }}</NextMarker>

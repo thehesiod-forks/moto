@@ -45,6 +45,7 @@ class Topic(CloudFormationModel):
         self.account_id = DEFAULT_ACCOUNT_ID
         self.display_name = ""
         self.delivery_policy = ""
+        self.kms_master_key_id = ""
         self.effective_delivery_policy = json.dumps(DEFAULT_EFFECTIVE_DELIVERY_POLICY)
         self.arn = make_arn_for_topic(self.account_id, name, sns_backend.region_name)
 
@@ -425,8 +426,15 @@ class SNSBackend(BaseBackend):
     def list_topics(self, next_token=None):
         return self._get_values_nexttoken(self.topics, next_token)
 
+    def delete_topic_subscriptions(self, topic):
+        for key, value in self.subscriptions.items():
+            if value.topic == topic:
+                self.subscriptions.pop(key)
+
     def delete_topic(self, arn):
         try:
+            topic = self.get_topic(arn)
+            self.delete_topic_subscriptions(topic)
             self.topics.pop(arn)
         except KeyError:
             raise SNSNotFoundError("Topic with arn {0} not found".format(arn))

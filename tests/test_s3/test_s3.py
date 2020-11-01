@@ -1710,6 +1710,17 @@ def test_website_redirect_location():
 
 
 @mock_s3
+def test_delimiter_optional_in_response():
+    s3 = boto3.client("s3", region_name=DEFAULT_REGION_NAME)
+    s3.create_bucket(Bucket="mybucket")
+    s3.put_object(Bucket="mybucket", Key="one", Body=b"1")
+    resp = s3.list_objects(Bucket="mybucket", MaxKeys=1)
+    assert resp.get("Delimiter") is None
+    resp = s3.list_objects(Bucket="mybucket", MaxKeys=1, Delimiter="/")
+    assert resp.get("Delimiter") == "/"
+
+
+@mock_s3
 def test_boto3_list_objects_truncated_response():
     s3 = boto3.client("s3", region_name=DEFAULT_REGION_NAME)
     s3.create_bucket(Bucket="mybucket")
@@ -1725,7 +1736,7 @@ def test_boto3_list_objects_truncated_response():
     assert resp["MaxKeys"] == 1
     assert resp["IsTruncated"] == True
     assert resp.get("Prefix") is None
-    assert resp["Delimiter"] == "None"
+    assert resp.get("Delimiter") is None
     assert "NextMarker" in resp
 
     next_marker = resp["NextMarker"]
@@ -1738,7 +1749,7 @@ def test_boto3_list_objects_truncated_response():
     assert resp["MaxKeys"] == 1
     assert resp["IsTruncated"] == True
     assert resp.get("Prefix") is None
-    assert resp["Delimiter"] == "None"
+    assert resp.get("Delimiter") is None
     assert "NextMarker" in resp
 
     next_marker = resp["NextMarker"]
@@ -1751,7 +1762,7 @@ def test_boto3_list_objects_truncated_response():
     assert resp["MaxKeys"] == 1
     assert resp["IsTruncated"] == False
     assert resp.get("Prefix") is None
-    assert resp["Delimiter"] == "None"
+    assert resp.get("Delimiter") is None
     assert "NextMarker" not in resp
 
 
@@ -4878,3 +4889,37 @@ def test_presigned_put_url_with_custom_headers():
 
     s3.delete_object(Bucket=bucket, Key=key)
     s3.delete_bucket(Bucket=bucket)
+
+
+@mock_s3
+def test_request_partial_content_should_contain_content_length():
+    bucket = "bucket"
+    object_key = "key"
+    s3 = boto3.resource("s3")
+    s3.create_bucket(Bucket=bucket)
+    s3.Object(bucket, object_key).put(Body="some text")
+
+    file = s3.Object(bucket, object_key)
+    response = file.get(Range="bytes=0-1024")
+    response["ContentLength"].should.equal(9)
+
+
+@mock_s3
+def test_request_partial_content_should_contain_actual_content_length():
+    bucket = "bucket"
+    object_key = "key"
+    s3 = boto3.resource("s3")
+    s3.create_bucket(Bucket=bucket)
+    s3.Object(bucket, object_key).put(Body="some text")
+
+    file = s3.Object(bucket, object_key)
+    requested_range = "bytes=1024-"
+    try:
+        file.get(Range=requested_range)
+    except botocore.client.ClientError as e:
+        e.response["Error"]["Code"].should.equal("InvalidRange")
+        e.response["Error"]["Message"].should.equal(
+            "The requested range is not satisfiable"
+        )
+        e.response["Error"]["ActualObjectSize"].should.equal("9")
+        e.response["Error"]["RangeRequested"].should.equal(requested_range)

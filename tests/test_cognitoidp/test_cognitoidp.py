@@ -1085,6 +1085,13 @@ def test_list_users():
     result["Users"].should.have.length_of(1)
     result["Users"][0]["Username"].should.equal(username_bis)
 
+    # checking Filter with space
+    result = conn.list_users(
+        UserPoolId=user_pool_id, Filter='phone_number = "+33666666666'
+    )
+    result["Users"].should.have.length_of(1)
+    result["Users"][0]["Username"].should.equal(username_bis)
+
 
 @mock_cognitoidp
 def test_list_users_returns_limit_items():
@@ -1807,6 +1814,30 @@ def test_respond_to_auth_challenge_with_invalid_secret_hash():
         caught = True
 
     caught.should.be.true
+
+
+@mock_cognitoidp
+def test_admin_set_user_password():
+    conn = boto3.client("cognito-idp", "us-west-2")
+
+    username = str(uuid.uuid4())
+    value = str(uuid.uuid4())
+    password = str(uuid.uuid4())
+    user_pool_id = conn.create_user_pool(PoolName=str(uuid.uuid4()))["UserPool"]["Id"]
+    conn.admin_create_user(
+        UserPoolId=user_pool_id,
+        Username=username,
+        UserAttributes=[{"Name": "thing", "Value": value}],
+    )
+    conn.admin_set_user_password(
+        UserPoolId=user_pool_id, Username=username, Password=password, Permanent=True
+    )
+    result = conn.admin_get_user(UserPoolId=user_pool_id, Username=username)
+    result["Username"].should.equal(username)
+    result["UserAttributes"].should.have.length_of(1)
+    result["UserAttributes"][0]["Name"].should.equal("thing")
+    result["UserAttributes"][0]["Value"].should.equal(value)
+    result["UserStatus"].should.equal("CONFIRMED")
 
 
 # Test will retrieve public key from cognito.amazonaws.com/.well-known/jwks.json,

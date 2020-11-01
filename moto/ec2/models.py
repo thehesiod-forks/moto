@@ -27,12 +27,15 @@ from moto.core.utils import (
     iso_8601_datetime_with_milliseconds,
     camelcase_to_underscores,
 )
-from moto.iam.models import ACCOUNT_ID
+from moto.core import ACCOUNT_ID
+from moto.kms import kms_backends
+
 from .exceptions import (
     CidrLimitExceeded,
     DependencyViolationError,
     EC2ClientError,
     FilterNotImplementedError,
+    FlowLogAlreadyExists,
     GatewayNotAttachedError,
     InvalidAddressError,
     InvalidAllocationIdError,
@@ -52,6 +55,10 @@ from .exceptions import (
     InvalidKeyPairDuplicateError,
     InvalidKeyPairFormatError,
     InvalidKeyPairNameError,
+    InvalidAggregationIntervalParameterError,
+    InvalidDependantParameterError,
+    InvalidDependantParameterTypeError,
+    InvalidFlowLogIdError,
     InvalidLaunchTemplateNameError,
     InvalidNetworkAclIdError,
     InvalidNetworkAttachmentIdError,
@@ -91,6 +98,7 @@ from .exceptions import (
     ResourceAlreadyAssociatedError,
     RulesPerSecurityGroupLimitExceededError,
     TagLimitExceeded,
+    InvalidParameterDependency,
 )
 from .utils import (
     EC2_RESOURCE_TO_PREFIX,
@@ -123,6 +131,7 @@ from .utils import (
     random_spot_request_id,
     random_subnet_id,
     random_subnet_association_id,
+    random_flow_log_id,
     random_volume_id,
     random_vpc_id,
     random_vpc_cidr_association_id,
@@ -1176,6 +1185,7 @@ class TagBackend(object):
         "subnet",
         "volume",
         "vpc",
+        "vpc-flow-log",
         "vpc-peering-connection" "vpn-connection",
         "vpn-gateway",
     ]
@@ -2417,7 +2427,14 @@ class VolumeAttachment(CloudFormationModel):
 
 class Volume(TaggedEC2Resource, CloudFormationModel):
     def __init__(
-        self, ec2_backend, volume_id, size, zone, snapshot_id=None, encrypted=False
+        self,
+        ec2_backend,
+        volume_id,
+        size,
+        zone,
+        snapshot_id=None,
+        encrypted=False,
+        kms_key_id=None,
     ):
         self.id = volume_id
         self.size = size
@@ -2427,6 +2444,7 @@ class Volume(TaggedEC2Resource, CloudFormationModel):
         self.snapshot_id = snapshot_id
         self.ec2_backend = ec2_backend
         self.encrypted = encrypted
+        self.kms_key_id = kms_key_id
 
     @staticmethod
     def cloudformation_name_type():
@@ -2540,7 +2558,13 @@ class EBSBackend(object):
         self.snapshots = {}
         super(EBSBackend, self).__init__()
 
-    def create_volume(self, size, zone_name, snapshot_id=None, encrypted=False):
+    def create_volume(
+        self, size, zone_name, snapshot_id=None, encrypted=False, kms_key_id=None
+    ):
+        if kms_key_id and not encrypted:
+            raise InvalidParameterDependency("KmsKeyId", "Encrypted")
+        if encrypted and not kms_key_id:
+            kms_key_id = self._get_default_encryption_key()
         volume_id = random_volume_id()
         zone = self.get_zone_by_name(zone_name)
         if snapshot_id:
@@ -2549,7 +2573,7 @@ class EBSBackend(object):
                 size = snapshot.volume.size
             if snapshot.encrypted:
                 encrypted = snapshot.encrypted
-        volume = Volume(self, volume_id, size, zone, snapshot_id, encrypted)
+        volume = Volume(self, volume_id, size, zone, snapshot_id, encrypted, kms_key_id)
         self.volumes[volume_id] = volume
         return volume
 
@@ -2696,6 +2720,25 @@ class EBSBackend(object):
             snapshot.create_volume_permission_groups.difference_update(groups)
 
         return True
+
+    def _get_default_encryption_key(self):
+        # https://aws.amazon.com/kms/features/#AWS_Service_Integration
+        # An AWS managed CMK is created automatically when you first create
+        # an encrypted resource using an AWS service integrated with KMS.
+        kms = kms_backends[self.region_name]
+        ebs_alias = "alias/aws/ebs"
+        if not kms.alias_exists(ebs_alias):
+            key = kms.create_key(
+                policy="",
+                key_usage="ENCRYPT_DECRYPT",
+                customer_master_key_spec="SYMMETRIC_DEFAULT",
+                description="Default master key that protects my EBS volumes when no other key is defined",
+                tags=None,
+                region=self.region_name,
+            )
+            kms.add_alias(key.id, ebs_alias)
+        ebs_key = kms.describe_key(ebs_alias)
+        return ebs_key.arn
 
 
 class VPC(TaggedEC2Resource, CloudFormationModel):
@@ -2892,6 +2935,7 @@ class VPCBackend(object):
         cidr_block,
         instance_tenancy="default",
         amazon_provided_ipv6_cidr_block=False,
+        tags=[],
     ):
         vpc_id = random_vpc_id()
         try:
@@ -2910,6 +2954,12 @@ class VPCBackend(object):
             instance_tenancy,
             amazon_provided_ipv6_cidr_block,
         )
+
+        for tag in tags:
+            tag_key = tag.get("Key")
+            tag_value = tag.get("Value")
+            vpc.add_tag(tag_key, tag_value)
+
         self.vpcs[vpc_id] = vpc
 
         # AWS creates a default main route table and security group.
@@ -3409,24 +3459,36 @@ class SubnetBackend(object):
         availability_zone=None,
         availability_zone_id=None,
         context=None,
+        tags=[],
     ):
         subnet_id = random_subnet_id()
         vpc = self.get_vpc(
             vpc_id
         )  # Validate VPC exists and the supplied CIDR block is a subnet of the VPC's
-        vpc_cidr_block = ipaddress.IPv4Network(
-            six.text_type(vpc.cidr_block), strict=False
-        )
+        vpc_cidr_blocks = [
+            ipaddress.IPv4Network(
+                six.text_type(cidr_block_association["cidr_block"]), strict=False
+            )
+            for cidr_block_association in vpc.get_cidr_block_association_set()
+        ]
         try:
             subnet_cidr_block = ipaddress.IPv4Network(
                 six.text_type(cidr_block), strict=False
             )
         except ValueError:
             raise InvalidCIDRBlockParameterError(cidr_block)
-        if not (
-            vpc_cidr_block.network_address <= subnet_cidr_block.network_address
-            and vpc_cidr_block.broadcast_address >= subnet_cidr_block.broadcast_address
-        ):
+
+        subnet_in_vpc_cidr_range = False
+        for vpc_cidr_block in vpc_cidr_blocks:
+            if (
+                vpc_cidr_block.network_address <= subnet_cidr_block.network_address
+                and vpc_cidr_block.broadcast_address
+                >= subnet_cidr_block.broadcast_address
+            ):
+                subnet_in_vpc_cidr_range = True
+                break
+
+        if not subnet_in_vpc_cidr_range:
             raise InvalidSubnetRangeError(cidr_block)
 
         for subnet in self.get_all_subnets(filters={"vpc-id": vpc_id}):
@@ -3479,6 +3541,11 @@ class SubnetBackend(object):
             assign_ipv6_address_on_creation=False,
         )
 
+        for tag in tags:
+            tag_key = tag.get("Key")
+            tag_value = tag.get("Value")
+            subnet.add_tag(tag_key, tag_value)
+
         # AWS associates a new subnet with the default Network ACL
         self.associate_default_network_acl_with_subnet(subnet_id, vpc_id)
         self.subnets[availability_zone][subnet_id] = subnet
@@ -3509,6 +3576,292 @@ class SubnetBackend(object):
             setattr(subnet, attr_name, attr_value)
         else:
             raise InvalidParameterValueError(attr_name)
+
+
+class FlowLogs(TaggedEC2Resource, CloudFormationModel):
+    def __init__(
+        self,
+        ec2_backend,
+        flow_log_id,
+        resource_id,
+        traffic_type,
+        log_destination,
+        log_group_name,
+        deliver_logs_permission_arn,
+        max_aggregation_interval,
+        log_destination_type,
+        log_format,
+        deliver_logs_status="SUCCESS",
+        deliver_logs_error_message=None,
+    ):
+        self.ec2_backend = ec2_backend
+        self.id = flow_log_id
+        self.resource_id = resource_id
+        self.traffic_type = traffic_type
+        self.log_destination = log_destination
+        self.log_group_name = log_group_name
+        self.deliver_logs_permission_arn = deliver_logs_permission_arn
+        self.deliver_logs_status = deliver_logs_status
+        self.deliver_logs_error_message = deliver_logs_error_message
+        self.max_aggregation_interval = max_aggregation_interval
+        self.log_destination_type = log_destination_type
+        self.log_format = log_format
+
+        self.created_at = utc_date_and_time()
+
+    @staticmethod
+    def cloudformation_name_type():
+        return None
+
+    @staticmethod
+    def cloudformation_type():
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-flowlog.html
+        return "AWS::EC2::FlowLog"
+
+    @classmethod
+    def create_from_cloudformation_json(
+        cls, resource_name, cloudformation_json, region_name
+    ):
+        properties = cloudformation_json["Properties"]
+
+        resource_type = properties.get("ResourceType")
+        resource_id = [properties.get("ResourceId")]
+        traffic_type = properties.get("TrafficType")
+        deliver_logs_permission_arn = properties.get("DeliverLogsPermissionArn")
+        log_destination_type = properties.get("LogDestinationType")
+        log_destination = properties.get("LogDestination")
+        log_group_name = properties.get("LogGroupName")
+        log_format = properties.get("LogFormat")
+        max_aggregation_interval = properties.get("MaxAggregationInterval")
+
+        ec2_backend = ec2_backends[region_name]
+        flow_log, _ = ec2_backend.create_flow_logs(
+            resource_type,
+            resource_id,
+            traffic_type,
+            deliver_logs_permission_arn,
+            log_destination_type,
+            log_destination,
+            log_group_name,
+            log_format,
+            max_aggregation_interval,
+        )
+        for tag in properties.get("Tags", []):
+            tag_key = tag["Key"]
+            tag_value = tag["Value"]
+            flow_log[0].add_tag(tag_key, tag_value)
+
+        return flow_log[0]
+
+    @property
+    def physical_resource_id(self):
+        return self.id
+
+    def get_filter_value(self, filter_name):
+        """
+        API Version 2016-11-15 defines the following filters for DescribeFlowLogs:
+
+        * deliver-log-status
+        * log-destination-type
+        * flow-log-id
+        * log-group-name
+        * resource-id
+        * traffic-type
+        * tag:key=value
+        * tag-key
+
+        Taken from: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeFlowLogs.html
+        """
+        if filter_name == "resource-id":
+            return self.resource_id
+        elif filter_name == "traffic-type":
+            return self.traffic_type
+        elif filter_name == "log-destination-type":
+            return self.log_destination_type
+        elif filter_name == "flow-log-id":
+            return self.id
+        elif filter_name == "log-group-name":
+            return self.log_group_name
+        elif filter_name == "deliver-log-status":
+            return "SUCCESS"
+        else:
+            return super(FlowLogs, self).get_filter_value(
+                filter_name, "DescribeFlowLogs"
+            )
+
+
+class FlowLogsBackend(object):
+    def __init__(self):
+        self.flow_logs = defaultdict(dict)
+        super(FlowLogsBackend, self).__init__()
+
+    def _validate_request(
+        self,
+        log_group_name,
+        log_destination,
+        log_destination_type,
+        max_aggregation_interval,
+        deliver_logs_permission_arn,
+    ):
+        if log_group_name is None and log_destination is None:
+            raise InvalidDependantParameterError(
+                "LogDestination", "LogGroupName", "not provided",
+            )
+
+        if log_destination_type == "s3":
+            if log_group_name is not None:
+                raise InvalidDependantParameterTypeError(
+                    "LogDestination", "cloud-watch-logs", "LogGroupName",
+                )
+        elif log_destination_type == "cloud-watch-logs":
+            if deliver_logs_permission_arn is None:
+                raise InvalidDependantParameterError(
+                    "DeliverLogsPermissionArn",
+                    "LogDestinationType",
+                    "cloud-watch-logs",
+                )
+
+        if max_aggregation_interval not in ["60", "600"]:
+            raise InvalidAggregationIntervalParameterError(
+                "Flow Log Max Aggregation Interval"
+            )
+
+    def create_flow_logs(
+        self,
+        resource_type,
+        resource_ids,
+        traffic_type,
+        deliver_logs_permission_arn,
+        log_destination_type,
+        log_destination,
+        log_group_name,
+        log_format,
+        max_aggregation_interval,
+    ):
+        # Guess it's best to put it here due to possible
+        # lack of them in the CloudFormation template
+        max_aggregation_interval = (
+            "600" if max_aggregation_interval is None else max_aggregation_interval
+        )
+        log_destination_type = (
+            "cloud-watch-logs" if log_destination_type is None else log_destination_type
+        )
+        log_format = (
+            "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}"
+            if log_format is None
+            else log_format
+        )
+
+        # Validate the requests paremeters
+        self._validate_request(
+            log_group_name,
+            log_destination,
+            log_destination_type,
+            max_aggregation_interval,
+            deliver_logs_permission_arn,
+        )
+
+        flow_logs_set = []
+        unsuccessful = []
+
+        for resource_id in resource_ids:
+            deliver_logs_status = "SUCCESS"
+            deliver_logs_error_message = None
+            flow_log_id = random_flow_log_id()
+            if resource_type == "VPC":
+                # Validate VPCs exist
+                self.get_vpc(resource_id)
+            elif resource_type == "Subnet":
+                # Validate Subnets exist
+                self.get_subnet(resource_id)
+            elif resource_type == "NetworkInterface":
+                # Validate NetworkInterfaces exist
+                self.get_network_interface(resource_id)
+
+            if log_destination_type == "s3":
+                from moto.s3.models import s3_backend
+                from moto.s3.exceptions import MissingBucket
+
+                arn = log_destination.split(":", 5)[5]
+                try:
+                    s3_backend.get_bucket(arn)
+                except MissingBucket:
+                    # Instead of creating FlowLog report
+                    # the unsuccessful status for the
+                    # given resource_id
+                    unsuccessful.append(
+                        (
+                            resource_id,
+                            "400",
+                            "LogDestination: {0} does not exist.".format(arn),
+                        )
+                    )
+                    continue
+            elif log_destination_type == "cloud-watch-logs":
+                from moto.logs.models import logs_backends
+                from moto.logs.exceptions import ResourceNotFoundException
+
+                # API allows to create a FlowLog with a
+                # non-existing LogGroup. It however later
+                # on reports the FAILED delivery status.
+                try:
+                    # Need something easy to check the group exists.
+                    # The list_tags_log_group seems to do the trick.
+                    logs_backends[self.region_name].list_tags_log_group(log_group_name)
+                except ResourceNotFoundException:
+                    deliver_logs_status = "FAILED"
+                    deliver_logs_error_message = "Access error"
+
+            all_flow_logs = self.describe_flow_logs()
+            if any(
+                fl.resource_id == resource_id
+                and (
+                    fl.log_group_name == log_group_name
+                    or fl.log_destination == log_destination
+                )
+                for fl in all_flow_logs
+            ):
+                raise FlowLogAlreadyExists()
+            flow_logs = FlowLogs(
+                self,
+                flow_log_id,
+                resource_id,
+                traffic_type,
+                log_destination,
+                log_group_name,
+                deliver_logs_permission_arn,
+                max_aggregation_interval,
+                log_destination_type,
+                log_format,
+                deliver_logs_status,
+                deliver_logs_error_message,
+            )
+            self.flow_logs[flow_log_id] = flow_logs
+            flow_logs_set.append(flow_logs)
+
+        return flow_logs_set, unsuccessful
+
+    def describe_flow_logs(self, flow_log_ids=None, filters=None):
+        matches = itertools.chain([i for i in self.flow_logs.values()])
+        if flow_log_ids:
+            matches = [flow_log for flow_log in matches if flow_log.id in flow_log_ids]
+        if filters:
+            matches = generic_filter(filters, matches)
+        return matches
+
+    def delete_flow_logs(self, flow_log_ids):
+        non_existing = []
+        for flow_log in flow_log_ids:
+            if flow_log in self.flow_logs:
+                self.flow_logs.pop(flow_log, None)
+            else:
+                non_existing.append(flow_log)
+
+        if non_existing:
+            raise InvalidFlowLogIdError(
+                len(flow_log_ids), " ".join(x for x in flow_log_ids),
+            )
+        return True
 
 
 class SubnetRouteTableAssociation(CloudFormationModel):
@@ -4510,13 +4863,15 @@ class SpotFleetBackend(object):
         return True
 
 
-class ElasticAddress(CloudFormationModel):
-    def __init__(self, domain, address=None):
+class ElasticAddress(TaggedEC2Resource, CloudFormationModel):
+    def __init__(self, ec2_backend, domain, address=None):
+        self.ec2_backend = ec2_backend
         if address:
             self.public_ip = address
         else:
             self.public_ip = random_ip()
         self.allocation_id = random_eip_allocation_id() if domain == "vpc" else None
+        self.id = self.allocation_id
         self.domain = domain
         self.instance = None
         self.eni = None
@@ -4578,9 +4933,13 @@ class ElasticAddress(CloudFormationModel):
             return self.eni.private_ip_address
         elif filter_name == "public-ip":
             return self.public_ip
-        else:
+        elif filter_name == "network-interface-owner-id":
             # TODO: implement network-interface-owner-id
             raise FilterNotImplementedError(filter_name, "DescribeAddresses")
+        else:
+            return super(ElasticAddress, self).get_filter_value(
+                filter_name, "DescribeAddresses"
+            )
 
 
 class ElasticAddressBackend(object):
@@ -4592,9 +4951,9 @@ class ElasticAddressBackend(object):
         if domain not in ["standard", "vpc"]:
             raise InvalidDomainError(domain)
         if address:
-            address = ElasticAddress(domain, address)
+            address = ElasticAddress(self, domain=domain, address=address)
         else:
-            address = ElasticAddress(domain)
+            address = ElasticAddress(self, domain=domain)
         self.addresses.append(address)
         return address
 
@@ -5511,6 +5870,7 @@ class EC2Backend(
     VPCBackend,
     SubnetBackend,
     SubnetRouteTableAssociationBackend,
+    FlowLogsBackend,
     NetworkInterfaceBackend,
     VPNConnectionBackend,
     VPCPeeringConnectionBackend,

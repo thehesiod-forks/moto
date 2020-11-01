@@ -3936,6 +3936,37 @@ def test_update_supports_list_append_maps():
     )
 
 
+@requires_boto_gte("2.9")
+@mock_dynamodb2
+def test_update_supports_nested_update_if_nested_value_not_exists():
+    dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+    name = "TestTable"
+
+    dynamodb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "user_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "user_id", "AttributeType": "S"}],
+        ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+
+    table = dynamodb.Table(name)
+    table.put_item(
+        Item={"user_id": "1234", "friends": {"5678": {"name": "friend_5678"}},},
+    )
+    table.update_item(
+        Key={"user_id": "1234"},
+        ExpressionAttributeNames={"#friends": "friends", "#friendid": "0000",},
+        ExpressionAttributeValues={":friend": {"name": "friend_0000"},},
+        UpdateExpression="SET #friends.#friendid = :friend",
+        ReturnValues="UPDATED_NEW",
+    )
+    item = table.get_item(Key={"user_id": "1234"})["Item"]
+    assert item == {
+        "user_id": "1234",
+        "friends": {"5678": {"name": "friend_5678"}, "0000": {"name": "friend_0000"},},
+    }
+
+
 @mock_dynamodb2
 def test_update_supports_list_append_with_nested_if_not_exists_operation():
     dynamo = boto3.resource("dynamodb", region_name="us-west-1")
@@ -4254,7 +4285,8 @@ def test_valid_transact_get_items():
         ]
     )
     res["Responses"][0]["Item"].should.equal({"id": {"S": "1"}, "sort_key": {"S": "1"}})
-    len(res["Responses"]).should.equal(1)
+    len(res["Responses"]).should.equal(2)
+    res["Responses"][1].should.equal({})
 
     res = client.transact_get_items(
         TransactItems=[
@@ -5414,3 +5446,62 @@ def test_lsi_projection_type_keys_only():
     items[0].should.equal(
         {"partitionKey": "pk-1", "sortKey": "sk-1", "lsiK1SortKey": "lsi-sk"}
     )
+
+
+@mock_dynamodb2
+def test_set_attribute_is_dropped_if_empty_after_update_expression():
+    table_name, item_key, set_item = "test-table", "test-id", "test-data"
+    client = boto3.client("dynamodb", region_name="us-east-1")
+    client.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "customer", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "customer", "AttributeType": "S"}],
+        ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+
+    client.update_item(
+        TableName=table_name,
+        Key={"customer": {"S": item_key}},
+        UpdateExpression="ADD orders :order",
+        ExpressionAttributeValues={":order": {"SS": [set_item]}},
+    )
+    resp = client.scan(TableName=table_name, ProjectionExpression="customer, orders")
+    item = resp["Items"][0]
+    item.should.have.key("customer")
+    item.should.have.key("orders")
+
+    client.update_item(
+        TableName=table_name,
+        Key={"customer": {"S": item_key}},
+        UpdateExpression="DELETE orders :order",
+        ExpressionAttributeValues={":order": {"SS": [set_item]}},
+    )
+    resp = client.scan(TableName=table_name, ProjectionExpression="customer, orders")
+    item = resp["Items"][0]
+    item.should.have.key("customer")
+    item.should_not.have.key("orders")
+
+
+@mock_dynamodb2
+def test_transact_get_items_should_return_empty_map_for_non_existent_item():
+    client = boto3.client("dynamodb", region_name="us-west-2")
+    table_name = "test-table"
+    key_schema = [{"AttributeName": "id", "KeyType": "HASH"}]
+    attribute_definitions = [{"AttributeName": "id", "AttributeType": "S"}]
+    client.create_table(
+        TableName=table_name,
+        KeySchema=key_schema,
+        AttributeDefinitions=attribute_definitions,
+        ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+    item = {"id": {"S": "1"}}
+    client.put_item(TableName=table_name, Item=item)
+    items = client.transact_get_items(
+        TransactItems=[
+            {"Get": {"Key": {"id": {"S": "1"}}, "TableName": table_name}},
+            {"Get": {"Key": {"id": {"S": "2"}}, "TableName": table_name}},
+        ]
+    ).get("Responses", [])
+    items.should.have.length_of(2)
+    items[0].should.equal({"Item": item})
+    items[1].should.equal({})

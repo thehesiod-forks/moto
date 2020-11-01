@@ -9,11 +9,10 @@ import boto
 import boto.vpc
 from boto.exception import EC2ResponseError
 from botocore.exceptions import ParamValidationError, ClientError
-import json
 import sure  # noqa
 import random
 
-from moto import mock_cloudformation_deprecated, mock_ec2, mock_ec2_deprecated
+from moto import mock_ec2, mock_ec2_deprecated
 
 
 @mock_ec2_deprecated
@@ -311,38 +310,6 @@ def test_get_subnets_filtering():
     ).should.throw(NotImplementedError)
 
 
-@mock_ec2_deprecated
-@mock_cloudformation_deprecated
-def test_subnet_tags_through_cloudformation():
-    vpc_conn = boto.vpc.connect_to_region("us-west-1")
-    vpc = vpc_conn.create_vpc("10.0.0.0/16")
-
-    subnet_template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Resources": {
-            "testSubnet": {
-                "Type": "AWS::EC2::Subnet",
-                "Properties": {
-                    "VpcId": vpc.id,
-                    "CidrBlock": "10.0.0.0/24",
-                    "AvailabilityZone": "us-west-1b",
-                    "Tags": [
-                        {"Key": "foo", "Value": "bar"},
-                        {"Key": "blah", "Value": "baz"},
-                    ],
-                },
-            }
-        },
-    }
-    cf_conn = boto.cloudformation.connect_to_region("us-west-1")
-    template_json = json.dumps(subnet_template)
-    cf_conn.create_stack("test_stack", template_body=template_json)
-
-    subnet = vpc_conn.get_all_subnets(filters={"cidrBlock": "10.0.0.0/24"})[0]
-    subnet.tags["foo"].should.equal("bar")
-    subnet.tags["blah"].should.equal("baz")
-
-
 @mock_ec2
 def test_create_subnet_response_fields():
     ec2 = boto3.resource("ec2", region_name="us-west-1")
@@ -360,7 +327,7 @@ def test_create_subnet_response_fields():
     subnet.should.have.key("State")
     subnet.should.have.key("SubnetId")
     subnet.should.have.key("VpcId")
-    subnet.shouldnt.have.key("Tags")
+    subnet.should.have.key("Tags")
     subnet.should.have.key("DefaultForAz").which.should.equal(False)
     subnet.should.have.key("MapPublicIpOnLaunch").which.should.equal(False)
     subnet.should.have.key("OwnerId")
@@ -451,6 +418,24 @@ def test_create_subnet_with_invalid_cidr_range():
 
 
 @mock_ec2
+def test_create_subnet_with_invalid_cidr_range_multiple_vpc_cidr_blocks():
+    ec2 = boto3.resource("ec2", region_name="us-west-1")
+
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    ec2.meta.client.associate_vpc_cidr_block(CidrBlock="10.1.0.0/16", VpcId=vpc.id)
+    vpc.reload()
+    vpc.is_default.shouldnt.be.ok
+
+    subnet_cidr_block = "10.2.0.0/20"
+    with assert_raises(ClientError) as ex:
+        subnet = ec2.create_subnet(VpcId=vpc.id, CidrBlock=subnet_cidr_block)
+    str(ex.exception).should.equal(
+        "An error occurred (InvalidSubnet.Range) when calling the CreateSubnet "
+        "operation: The CIDR '{}' is invalid.".format(subnet_cidr_block)
+    )
+
+
+@mock_ec2
 def test_create_subnet_with_invalid_cidr_block_parameter():
     ec2 = boto3.resource("ec2", region_name="us-west-1")
 
@@ -467,6 +452,46 @@ def test_create_subnet_with_invalid_cidr_block_parameter():
             subnet_cidr_block
         )
     )
+
+
+@mock_ec2
+def test_create_subnets_with_multiple_vpc_cidr_blocks():
+    ec2 = boto3.resource("ec2", region_name="us-west-1")
+    client = boto3.client("ec2", region_name="us-west-1")
+
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+    ec2.meta.client.associate_vpc_cidr_block(CidrBlock="10.1.0.0/16", VpcId=vpc.id)
+    vpc.reload()
+    vpc.is_default.shouldnt.be.ok
+
+    subnet_cidr_block_primary = "10.0.0.0/24"
+    subnet_primary = ec2.create_subnet(
+        VpcId=vpc.id, CidrBlock=subnet_cidr_block_primary
+    )
+
+    subnet_cidr_block_secondary = "10.1.0.0/24"
+    subnet_secondary = ec2.create_subnet(
+        VpcId=vpc.id, CidrBlock=subnet_cidr_block_secondary
+    )
+
+    subnets = client.describe_subnets(
+        SubnetIds=[subnet_primary.id, subnet_secondary.id]
+    )["Subnets"]
+    subnets.should.have.length_of(2)
+
+    for subnet in subnets:
+        subnet.should.have.key("AvailabilityZone")
+        subnet.should.have.key("AvailabilityZoneId")
+        subnet.should.have.key("AvailableIpAddressCount")
+        subnet.should.have.key("CidrBlock")
+        subnet.should.have.key("State")
+        subnet.should.have.key("SubnetId")
+        subnet.should.have.key("VpcId")
+        subnet.shouldnt.have.key("Tags")
+        subnet.should.have.key("DefaultForAz").which.should.equal(False)
+        subnet.should.have.key("MapPublicIpOnLaunch").which.should.equal(False)
+        subnet.should.have.key("OwnerId")
+        subnet.should.have.key("AssignIpv6AddressOnCreation").which.should.equal(False)
 
 
 @mock_ec2
@@ -487,6 +512,23 @@ def test_create_subnets_with_overlapping_cidr_blocks():
             subnet_cidr_block
         )
     )
+
+
+@mock_ec2
+def test_create_subnet_with_tags():
+    ec2 = boto3.resource("ec2", region_name="us-west-1")
+    vpc = ec2.create_vpc(CidrBlock="172.31.0.0/16")
+
+    subnet = ec2.create_subnet(
+        VpcId=vpc.id,
+        CidrBlock="172.31.48.0/20",
+        AvailabilityZoneId="use1-az6",
+        TagSpecifications=[
+            {"ResourceType": "subnet", "Tags": [{"Key": "name", "Value": "some-vpc"}]}
+        ],
+    )
+
+    assert subnet.tags == [{"Key": "name", "Value": "some-vpc"}]
 
 
 @mock_ec2

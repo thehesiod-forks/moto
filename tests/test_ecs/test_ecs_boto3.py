@@ -1,7 +1,5 @@
 from __future__ import unicode_literals
 from datetime import datetime
-
-from copy import deepcopy
 import time
 
 from botocore.exceptions import ClientError
@@ -11,7 +9,6 @@ import json
 from moto.ec2 import utils as ec2_utils
 from uuid import UUID
 
-from moto import mock_cloudformation
 from moto import mock_ecs
 from moto import mock_ec2
 from nose.tools import assert_raises
@@ -977,6 +974,7 @@ def test_describe_container_instances():
     for instance in response["containerInstances"]:
         instance.keys().should.contain("runningTasksCount")
         instance.keys().should.contain("pendingTasksCount")
+        instance["registeredAt"].should.be.a("datetime.datetime")
 
     with assert_raises(ClientError) as e:
         ecs_client.describe_container_instances(
@@ -1673,120 +1671,6 @@ def test_resource_reservation_and_release_memory_reservation():
     container_instance_description["runningTasksCount"].should.equal(0)
 
 
-@mock_ecs
-@mock_cloudformation
-def test_create_cluster_through_cloudformation():
-    template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testCluster": {
-                "Type": "AWS::ECS::Cluster",
-                "Properties": {"ClusterName": "testcluster"},
-            }
-        },
-    }
-    template_json = json.dumps(template)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_clusters()
-    len(resp["clusterArns"]).should.equal(0)
-
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    cfn_conn.create_stack(StackName="test_stack", TemplateBody=template_json)
-
-    resp = ecs_conn.list_clusters()
-    len(resp["clusterArns"]).should.equal(1)
-
-
-@mock_ecs
-@mock_cloudformation
-def test_create_cluster_through_cloudformation_no_name():
-    # cloudformation should create a cluster name for you if you do not provide it
-    # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-cluster.html#cfn-ecs-cluster-clustername
-    template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {"testCluster": {"Type": "AWS::ECS::Cluster"}},
-    }
-    template_json = json.dumps(template)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    cfn_conn.create_stack(StackName="test_stack", TemplateBody=template_json)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_clusters()
-    len(resp["clusterArns"]).should.equal(1)
-
-
-@mock_ecs
-@mock_cloudformation
-def test_update_cluster_name_through_cloudformation_should_trigger_a_replacement():
-    template1 = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testCluster": {
-                "Type": "AWS::ECS::Cluster",
-                "Properties": {"ClusterName": "testcluster1"},
-            }
-        },
-    }
-    template2 = deepcopy(template1)
-    template2["Resources"]["testCluster"]["Properties"]["ClusterName"] = "testcluster2"
-    template1_json = json.dumps(template1)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    stack_resp = cfn_conn.create_stack(
-        StackName="test_stack", TemplateBody=template1_json
-    )
-
-    template2_json = json.dumps(template2)
-    cfn_conn.update_stack(StackName=stack_resp["StackId"], TemplateBody=template2_json)
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_clusters()
-    len(resp["clusterArns"]).should.equal(1)
-    resp["clusterArns"][0].endswith("testcluster2").should.be.true
-
-
-@mock_ecs
-@mock_cloudformation
-def test_create_task_definition_through_cloudformation():
-    template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testTaskDefinition": {
-                "Type": "AWS::ECS::TaskDefinition",
-                "Properties": {
-                    "ContainerDefinitions": [
-                        {
-                            "Name": "ecs-sample",
-                            "Image": "amazon/amazon-ecs-sample",
-                            "Cpu": "200",
-                            "Memory": "500",
-                            "Essential": "true",
-                        }
-                    ],
-                    "Volumes": [],
-                },
-            }
-        },
-    }
-    template_json = json.dumps(template)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    stack_name = "test_stack"
-    cfn_conn.create_stack(StackName=stack_name, TemplateBody=template_json)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_task_definitions()
-    len(resp["taskDefinitionArns"]).should.equal(1)
-    task_definition_arn = resp["taskDefinitionArns"][0]
-
-    task_definition_details = cfn_conn.describe_stack_resource(
-        StackName=stack_name, LogicalResourceId="testTaskDefinition"
-    )["StackResourceDetail"]
-    task_definition_details["PhysicalResourceId"].should.equal(task_definition_arn)
-
-
 @mock_ec2
 @mock_ecs
 def test_task_definitions_unable_to_be_placed():
@@ -1899,142 +1783,6 @@ def test_task_definitions_with_port_clash():
     response["tasks"][0]["desiredStatus"].should.equal("RUNNING")
     response["tasks"][0]["startedBy"].should.equal("moto")
     response["tasks"][0]["stoppedReason"].should.equal("")
-
-
-@mock_ecs
-@mock_cloudformation
-def test_update_task_definition_family_through_cloudformation_should_trigger_a_replacement():
-    template1 = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testTaskDefinition": {
-                "Type": "AWS::ECS::TaskDefinition",
-                "Properties": {
-                    "Family": "testTaskDefinition1",
-                    "ContainerDefinitions": [
-                        {
-                            "Name": "ecs-sample",
-                            "Image": "amazon/amazon-ecs-sample",
-                            "Cpu": "200",
-                            "Memory": "500",
-                            "Essential": "true",
-                        }
-                    ],
-                    "Volumes": [],
-                },
-            }
-        },
-    }
-    template1_json = json.dumps(template1)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    cfn_conn.create_stack(StackName="test_stack", TemplateBody=template1_json)
-
-    template2 = deepcopy(template1)
-    template2["Resources"]["testTaskDefinition"]["Properties"][
-        "Family"
-    ] = "testTaskDefinition2"
-    template2_json = json.dumps(template2)
-    cfn_conn.update_stack(StackName="test_stack", TemplateBody=template2_json)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_task_definitions(familyPrefix="testTaskDefinition2")
-    len(resp["taskDefinitionArns"]).should.equal(1)
-    resp["taskDefinitionArns"][0].endswith("testTaskDefinition2:1").should.be.true
-
-
-@mock_ecs
-@mock_cloudformation
-def test_create_service_through_cloudformation():
-    template = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testCluster": {
-                "Type": "AWS::ECS::Cluster",
-                "Properties": {"ClusterName": "testcluster"},
-            },
-            "testTaskDefinition": {
-                "Type": "AWS::ECS::TaskDefinition",
-                "Properties": {
-                    "ContainerDefinitions": [
-                        {
-                            "Name": "ecs-sample",
-                            "Image": "amazon/amazon-ecs-sample",
-                            "Cpu": "200",
-                            "Memory": "500",
-                            "Essential": "true",
-                        }
-                    ],
-                    "Volumes": [],
-                },
-            },
-            "testService": {
-                "Type": "AWS::ECS::Service",
-                "Properties": {
-                    "Cluster": {"Ref": "testCluster"},
-                    "DesiredCount": 10,
-                    "TaskDefinition": {"Ref": "testTaskDefinition"},
-                },
-            },
-        },
-    }
-    template_json = json.dumps(template)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    cfn_conn.create_stack(StackName="test_stack", TemplateBody=template_json)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_services(cluster="testcluster")
-    len(resp["serviceArns"]).should.equal(1)
-
-
-@mock_ecs
-@mock_cloudformation
-def test_update_service_through_cloudformation_should_trigger_replacement():
-    template1 = {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": "ECS Cluster Test CloudFormation",
-        "Resources": {
-            "testCluster": {
-                "Type": "AWS::ECS::Cluster",
-                "Properties": {"ClusterName": "testcluster"},
-            },
-            "testTaskDefinition": {
-                "Type": "AWS::ECS::TaskDefinition",
-                "Properties": {
-                    "ContainerDefinitions": [
-                        {
-                            "Name": "ecs-sample",
-                            "Image": "amazon/amazon-ecs-sample",
-                            "Cpu": "200",
-                            "Memory": "500",
-                            "Essential": "true",
-                        }
-                    ],
-                    "Volumes": [],
-                },
-            },
-            "testService": {
-                "Type": "AWS::ECS::Service",
-                "Properties": {
-                    "Cluster": {"Ref": "testCluster"},
-                    "TaskDefinition": {"Ref": "testTaskDefinition"},
-                    "DesiredCount": 10,
-                },
-            },
-        },
-    }
-    template_json1 = json.dumps(template1)
-    cfn_conn = boto3.client("cloudformation", region_name="us-west-1")
-    cfn_conn.create_stack(StackName="test_stack", TemplateBody=template_json1)
-    template2 = deepcopy(template1)
-    template2["Resources"]["testService"]["Properties"]["DesiredCount"] = 5
-    template2_json = json.dumps(template2)
-    cfn_conn.update_stack(StackName="test_stack", TemplateBody=template2_json)
-
-    ecs_conn = boto3.client("ecs", region_name="us-west-1")
-    resp = ecs_conn.list_services(cluster="testcluster")
-    len(resp["serviceArns"]).should.equal(1)
 
 
 @mock_ec2
@@ -3018,3 +2766,104 @@ def test_update_task_set():
     )["taskSets"][0]
     assert updated_task_set["scale"]["value"] == 25.0
     assert updated_task_set["scale"]["unit"] == "PERCENT"
+
+
+@mock_ec2
+@mock_ecs
+def test_list_tasks_with_filters():
+    ecs = boto3.client("ecs", region_name="us-east-1")
+    ec2 = boto3.resource("ec2", region_name="us-east-1")
+
+    _ = ecs.create_cluster(clusterName="test_cluster_1")
+    _ = ecs.create_cluster(clusterName="test_cluster_2")
+
+    test_instance = ec2.create_instances(
+        ImageId="ami-1234abcd", MinCount=1, MaxCount=1
+    )[0]
+
+    instance_id_document = json.dumps(
+        ec2_utils.generate_instance_identity_document(test_instance)
+    )
+
+    _ = ecs.register_container_instance(
+        cluster="test_cluster_1", instanceIdentityDocument=instance_id_document
+    )
+    _ = ecs.register_container_instance(
+        cluster="test_cluster_2", instanceIdentityDocument=instance_id_document
+    )
+
+    container_instances = ecs.list_container_instances(cluster="test_cluster_1")
+    container_id_1 = container_instances["containerInstanceArns"][0].split("/")[-1]
+    container_instances = ecs.list_container_instances(cluster="test_cluster_2")
+    container_id_2 = container_instances["containerInstanceArns"][0].split("/")[-1]
+
+    test_container_def = {
+        "name": "hello_world",
+        "image": "docker/hello-world:latest",
+        "cpu": 1024,
+        "memory": 400,
+        "essential": True,
+        "environment": [{"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}],
+        "logConfiguration": {"logDriver": "json-file"},
+    }
+
+    _ = ecs.register_task_definition(
+        family="test_task_def_1", containerDefinitions=[test_container_def],
+    )
+
+    _ = ecs.register_task_definition(
+        family="test_task_def_2", containerDefinitions=[test_container_def],
+    )
+
+    _ = ecs.start_task(
+        cluster="test_cluster_1",
+        taskDefinition="test_task_def_1",
+        overrides={},
+        containerInstances=[container_id_1],
+        startedBy="foo",
+    )
+
+    resp = ecs.start_task(
+        cluster="test_cluster_2",
+        taskDefinition="test_task_def_2",
+        overrides={},
+        containerInstances=[container_id_2],
+        startedBy="foo",
+    )
+    task_to_stop = resp["tasks"][0]["taskArn"]
+
+    _ = ecs.start_task(
+        cluster="test_cluster_1",
+        taskDefinition="test_task_def_1",
+        overrides={},
+        containerInstances=[container_id_1],
+        startedBy="bar",
+    )
+
+    len(ecs.list_tasks()["taskArns"]).should.equal(3)
+
+    len(ecs.list_tasks(cluster="test_cluster_1")["taskArns"]).should.equal(2)
+    len(ecs.list_tasks(cluster="test_cluster_2")["taskArns"]).should.equal(1)
+
+    len(ecs.list_tasks(containerInstance="bad-id")["taskArns"]).should.equal(0)
+    len(ecs.list_tasks(containerInstance=container_id_1)["taskArns"]).should.equal(2)
+    len(ecs.list_tasks(containerInstance=container_id_2)["taskArns"]).should.equal(1)
+
+    len(ecs.list_tasks(family="non-existent-family")["taskArns"]).should.equal(0)
+    len(ecs.list_tasks(family="test_task_def_1")["taskArns"]).should.equal(2)
+    len(ecs.list_tasks(family="test_task_def_2")["taskArns"]).should.equal(1)
+
+    len(ecs.list_tasks(startedBy="non-existent-entity")["taskArns"]).should.equal(0)
+    len(ecs.list_tasks(startedBy="foo")["taskArns"]).should.equal(2)
+    len(ecs.list_tasks(startedBy="bar")["taskArns"]).should.equal(1)
+
+    len(ecs.list_tasks(desiredStatus="RUNNING")["taskArns"]).should.equal(3)
+    _ = ecs.stop_task(cluster="test_cluster_2", task=task_to_stop, reason="for testing")
+    len(ecs.list_tasks(desiredStatus="RUNNING")["taskArns"]).should.equal(2)
+    len(ecs.list_tasks(desiredStatus="STOPPED")["taskArns"]).should.equal(1)
+
+    resp = ecs.list_tasks(cluster="test_cluster_1", startedBy="foo")
+    len(resp["taskArns"]).should.equal(1)
+
+    resp = ecs.list_tasks(containerInstance=container_id_1, startedBy="bar")
+    len(resp["taskArns"]).should.equal(1)
