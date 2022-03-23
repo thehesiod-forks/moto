@@ -1,21 +1,4 @@
-from __future__ import unicode_literals
-import json
-
-
-class AWSError(Exception):
-    TYPE = None
-    STATUS = 400
-
-    def __init__(self, message, type=None, status=None):
-        self.message = message
-        self.type = type if type is not None else self.TYPE
-        self.status = status if status is not None else self.STATUS
-
-    def response(self):
-        return (
-            json.dumps({"__type": self.type, "message": self.message}),
-            dict(status=self.status),
-        )
+from moto.core.exceptions import AWSError
 
 
 class ExecutionAlreadyExists(AWSError):
@@ -53,4 +36,12 @@ class InvalidToken(AWSError):
     STATUS = 400
 
     def __init__(self, message="Invalid token"):
-        super(InvalidToken, self).__init__("Invalid Token: {}".format(message))
+        super().__init__("Invalid Token: {}".format(message))
+
+
+class ResourceNotFound(AWSError):
+    TYPE = "ResourceNotFound"
+    STATUS = 400
+
+    def __init__(self, arn):
+        super().__init__("Resource not found: '{}'".format(arn))

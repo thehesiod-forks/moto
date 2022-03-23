@@ -1,4 +1,6 @@
-nose
-sure==1.4.11
+pytest
+pytest-cov
+pytest-xdist
+sure
 freezegun
-parameterized>=0.7.0
+pylint

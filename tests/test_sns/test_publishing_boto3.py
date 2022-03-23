@@ -1,19 +1,17 @@
-from __future__ import unicode_literals
-
 import base64
 import json
 
 import boto3
 import re
 from freezegun import freeze_time
-import sure  # noqa
+import sure  # noqa # pylint: disable=unused-import
 
-import responses
 from botocore.exceptions import ClientError
-from nose.tools import assert_raises
+import pytest
 from moto import mock_sns, mock_sqs, settings
 from moto.core import ACCOUNT_ID
-from moto.sns import sns_backend
+from moto.core.models import responses_mock
+from moto.sns import sns_backends
 
 MESSAGE_FROM_SQS_TEMPLATE = (
     '{\n  "Message": "%s",\n  "MessageId": "%s",\n  "Signature": "EXAMPLElDMXvB8r9R83tGoNn0ecwd5UjllzsvSvbItzfaMpN2nk5HVSw7XnOn/49IkxDKz8YrlH2qJXj2iZB0Zo2O71c4qQk1fMUDi3LGpij7RCW7AW9vYYsSqIKRnFS94ilu7NFhUzLiieYr4BKHpdTmdD6c0esKEYBpabxDSc=",\n  "SignatureVersion": "1",\n  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-f3ecfb7224c7233fe7bb5f59f96de52f.pem",\n  "Subject": "my subject",\n  "Timestamp": "2015-01-01T12:00:00.000Z",\n  "TopicArn": "arn:aws:sns:%s:'
@@ -42,11 +40,14 @@ def test_publish_to_sqs():
     )
     message = "my message"
     with freeze_time("2015-01-01 12:00:00"):
-        published_message = conn.publish(TopicArn=topic_arn, Message=message)
+        published_message = conn.publish(
+            TopicArn=topic_arn, Message=message, Subject="my subject"
+        )
     published_message_id = published_message["MessageId"]
 
     queue = sqs_conn.get_queue_by_name(QueueName="test-queue")
-    messages = queue.receive_messages(MaxNumberOfMessages=1)
+    with freeze_time("2015-01-01 12:00:01"):
+        messages = queue.receive_messages(MaxNumberOfMessages=1)
     expected = MESSAGE_FROM_SQS_TEMPLATE % (message, published_message_id, "us-east-1")
     acquired_message = re.sub(
         r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z",
@@ -77,8 +78,28 @@ def test_publish_to_sqs_raw():
     with freeze_time("2015-01-01 12:00:00"):
         topic.publish(Message=message)
 
-    messages = queue.receive_messages(MaxNumberOfMessages=1)
+    with freeze_time("2015-01-01 12:00:01"):
+        messages = queue.receive_messages(MaxNumberOfMessages=1)
     messages[0].body.should.equal(message)
+
+
+@mock_sns
+@mock_sqs
+def test_publish_to_sqs_fifo():
+    sns = boto3.resource("sns", region_name="us-east-1")
+    topic = sns.create_topic(
+        Name="topic.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )
+
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    queue = sqs.create_queue(
+        QueueName="queue.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+    )
+    topic.subscribe(Protocol="sqs", Endpoint=queue.attributes["QueueArn"])
+
+    topic.publish(Message="message", MessageGroupId="message_group_id")
 
 
 @mock_sqs
@@ -152,7 +173,7 @@ def test_publish_to_sqs_msg_attr_byte_value():
     sqs = boto3.resource("sqs", region_name="us-east-1")
     queue = sqs.create_queue(QueueName="test-queue")
     conn.subscribe(
-        TopicArn=topic_arn, Protocol="sqs", Endpoint=queue.attributes["QueueArn"],
+        TopicArn=topic_arn, Protocol="sqs", Endpoint=queue.attributes["QueueArn"]
     )
     queue_raw = sqs.create_queue(QueueName="test-queue-raw")
     conn.subscribe(
@@ -215,6 +236,49 @@ def test_publish_to_sqs_msg_attr_number_type():
     message.body.should.equal("test message")
 
 
+@mock_sqs
+@mock_sns
+def test_publish_to_sqs_msg_attr_different_formats():
+    """
+    Verify different Number-formats are processed correctly
+    """
+    sns = boto3.resource("sns", region_name="us-east-1")
+    topic = sns.create_topic(Name="test-topic")
+    sqs = boto3.resource("sqs", region_name="us-east-1")
+    sqs_client = boto3.client("sqs", region_name="us-east-1")
+    queue_raw = sqs.create_queue(QueueName="test-queue-raw")
+
+    topic.subscribe(
+        Protocol="sqs",
+        Endpoint=queue_raw.attributes["QueueArn"],
+        Attributes={"RawMessageDelivery": "true"},
+    )
+
+    topic.publish(
+        Message="test message",
+        MessageAttributes={
+            "integer": {"DataType": "Number", "StringValue": "123"},
+            "float": {"DataType": "Number", "StringValue": "12.34"},
+            "big-integer": {"DataType": "Number", "StringValue": "123456789"},
+            "big-float": {"DataType": "Number", "StringValue": "123456.789"},
+        },
+    )
+
+    messages_resp = sqs_client.receive_message(
+        QueueUrl=queue_raw.url, MessageAttributeNames=["All"]
+    )
+    message = messages_resp["Messages"][0]
+    message_attributes = message["MessageAttributes"]
+    message_attributes.should.equal(
+        {
+            "integer": {"DataType": "Number", "StringValue": "123"},
+            "float": {"DataType": "Number", "StringValue": "12.34"},
+            "big-integer": {"DataType": "Number", "StringValue": "123456789"},
+            "big-float": {"DataType": "Number", "StringValue": "123456.789"},
+        }
+    )
+
+
 @mock_sns
 def test_publish_sms():
     client = boto3.client("sns", region_name="us-east-1")
@@ -223,6 +287,7 @@ def test_publish_sms():
 
     result.should.contain("MessageId")
     if not settings.TEST_SERVER_MODE:
+        sns_backend = sns_backends["us-east-1"]
         sns_backend.sms_messages.should.have.key(result["MessageId"]).being.equal(
             ("+15551234567", "my message")
         )
@@ -233,16 +298,16 @@ def test_publish_bad_sms():
     client = boto3.client("sns", region_name="us-east-1")
 
     # Test invalid number
-    with assert_raises(ClientError) as cm:
+    with pytest.raises(ClientError) as cm:
         client.publish(PhoneNumber="NAA+15551234567", Message="my message")
-    cm.exception.response["Error"]["Code"].should.equal("InvalidParameter")
-    cm.exception.response["Error"]["Message"].should.contain("not meet the E164")
+    cm.value.response["Error"]["Code"].should.equal("InvalidParameter")
+    cm.value.response["Error"]["Message"].should.contain("not meet the E164")
 
     # Test to long ASCII message
-    with assert_raises(ClientError) as cm:
+    with pytest.raises(ClientError) as cm:
         client.publish(PhoneNumber="+15551234567", Message="a" * 1601)
-    cm.exception.response["Error"]["Code"].should.equal("InvalidParameter")
-    cm.exception.response["Error"]["Message"].should.contain("must be less than 1600")
+    cm.value.response["Error"]["Code"].should.equal("InvalidParameter")
+    cm.value.response["Error"]["Message"].should.contain("must be less than 1600")
 
 
 @mock_sqs
@@ -275,11 +340,14 @@ def test_publish_to_sqs_dump_json():
         sort_keys=True,
     )
     with freeze_time("2015-01-01 12:00:00"):
-        published_message = conn.publish(TopicArn=topic_arn, Message=message)
+        published_message = conn.publish(
+            TopicArn=topic_arn, Message=message, Subject="my subject"
+        )
     published_message_id = published_message["MessageId"]
 
     queue = sqs_conn.get_queue_by_name(QueueName="test-queue")
-    messages = queue.receive_messages(MaxNumberOfMessages=1)
+    with freeze_time("2015-01-01 12:00:01"):
+        messages = queue.receive_messages(MaxNumberOfMessages=1)
 
     escaped = message.replace('"', '\\"')
     expected = MESSAGE_FROM_SQS_TEMPLATE % (escaped, published_message_id, "us-east-1")
@@ -310,11 +378,14 @@ def test_publish_to_sqs_in_different_region():
 
     message = "my message"
     with freeze_time("2015-01-01 12:00:00"):
-        published_message = conn.publish(TopicArn=topic_arn, Message=message)
+        published_message = conn.publish(
+            TopicArn=topic_arn, Message=message, Subject="my subject"
+        )
     published_message_id = published_message["MessageId"]
 
     queue = sqs_conn.get_queue_by_name(QueueName="test-queue")
-    messages = queue.receive_messages(MaxNumberOfMessages=1)
+    with freeze_time("2015-01-01 12:00:01"):
+        messages = queue.receive_messages(MaxNumberOfMessages=1)
     expected = MESSAGE_FROM_SQS_TEMPLATE % (message, published_message_id, "us-west-1")
     acquired_message = re.sub(
         r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z",
@@ -332,7 +403,7 @@ def test_publish_to_http():
         json.loads.when.called_with(request.body.decode()).should_not.throw(Exception)
         return 200, {}, ""
 
-    responses.add_callback(
+    responses_mock.add_callback(
         method="POST", url="http://example.com/foobar", callback=callback
     )
 
@@ -345,9 +416,15 @@ def test_publish_to_http():
         TopicArn=topic_arn, Protocol="http", Endpoint="http://example.com/foobar"
     )
 
-    response = conn.publish(
-        TopicArn=topic_arn, Message="my message", Subject="my subject"
-    )
+    conn.publish(TopicArn=topic_arn, Message="my message", Subject="my subject")
+
+    if not settings.TEST_SERVER_MODE:
+        sns_backend = sns_backends["us-east-1"]
+        sns_backend.topics[topic_arn].sent_notifications.should.have.length_of(1)
+        notification = sns_backend.topics[topic_arn].sent_notifications[0]
+        _, msg, subject, _, _ = notification
+        msg.should.equal("my message")
+        subject.should.equal("my subject")
 
 
 @mock_sqs
@@ -382,16 +459,78 @@ def test_publish_subject():
         raise RuntimeError("Should have raised an InvalidParameter exception")
 
 
+@mock_sqs
+@mock_sns
+def test_publish_null_subject():
+    conn = boto3.client("sns", region_name="us-east-1")
+    conn.create_topic(Name="some-topic")
+    response = conn.list_topics()
+    topic_arn = response["Topics"][0]["TopicArn"]
+
+    sqs_conn = boto3.resource("sqs", region_name="us-east-1")
+    sqs_conn.create_queue(QueueName="test-queue")
+
+    conn.subscribe(
+        TopicArn=topic_arn,
+        Protocol="sqs",
+        Endpoint="arn:aws:sqs:us-east-1:{}:test-queue".format(ACCOUNT_ID),
+    )
+    message = "my message"
+    with freeze_time("2015-01-01 12:00:00"):
+        conn.publish(TopicArn=topic_arn, Message=message)
+
+    queue = sqs_conn.get_queue_by_name(QueueName="test-queue")
+    with freeze_time("2015-01-01 12:00:01"):
+        messages = queue.receive_messages(MaxNumberOfMessages=1)
+
+    acquired_message = json.loads(messages[0].body)
+    acquired_message["Message"].should.equal(message)
+    acquired_message.shouldnt.have.key("Subject")
+
+
 @mock_sns
 def test_publish_message_too_long():
     sns = boto3.resource("sns", region_name="us-east-1")
     topic = sns.create_topic(Name="some-topic")
 
-    with assert_raises(ClientError):
+    with pytest.raises(ClientError):
         topic.publish(Message="".join(["." for i in range(0, 262145)]))
 
     # message short enough - does not raise an error
     topic.publish(Message="".join(["." for i in range(0, 262144)]))
+
+
+@mock_sns
+def test_publish_fifo_needs_group_id():
+    sns = boto3.resource("sns", region_name="us-east-1")
+    topic = sns.create_topic(
+        Name="topic.fifo",
+        Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"},
+    )
+
+    with pytest.raises(
+        ClientError, match="The request must contain the parameter MessageGroupId"
+    ):
+        topic.publish(Message="message")
+
+    # message group included - OK
+    topic.publish(Message="message", MessageGroupId="message_group_id")
+
+
+@mock_sns
+@mock_sqs
+def test_publish_group_id_to_non_fifo():
+    sns = boto3.resource("sns", region_name="us-east-1")
+    topic = sns.create_topic(Name="topic")
+
+    with pytest.raises(
+        ClientError,
+        match="The request include parameter that is not valid for this queue type",
+    ):
+        topic.publish(Message="message", MessageGroupId="message_group_id")
+
+    # message group not included - OK
+    topic.publish(Message="message")
 
 
 def _setup_filter_policy_test(filter_policy):
@@ -409,13 +548,13 @@ def _setup_filter_policy_test(filter_policy):
         AttributeName="FilterPolicy", AttributeValue=json.dumps(filter_policy)
     )
 
-    return topic, subscription, queue
+    return topic, queue
 
 
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string():
-    topic, subscription, queue = _setup_filter_policy_test({"store": ["example_corp"]})
+    topic, queue = _setup_filter_policy_test({"store": ["example_corp"]})
 
     topic.publish(
         Message="match",
@@ -436,7 +575,7 @@ def test_filtering_exact_string():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_multiple_message_attributes():
-    topic, subscription, queue = _setup_filter_policy_test({"store": ["example_corp"]})
+    topic, queue = _setup_filter_policy_test({"store": ["example_corp"]})
 
     topic.publish(
         Message="match",
@@ -463,7 +602,7 @@ def test_filtering_exact_string_multiple_message_attributes():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_OR_matching():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {"store": ["example_corp", "different_corp"]}
     )
 
@@ -494,7 +633,7 @@ def test_filtering_exact_string_OR_matching():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_AND_matching_positive():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {"store": ["example_corp"], "event": ["order_cancelled"]}
     )
 
@@ -523,7 +662,7 @@ def test_filtering_exact_string_AND_matching_positive():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_AND_matching_no_match():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {"store": ["example_corp"], "event": ["order_cancelled"]}
     )
 
@@ -545,7 +684,7 @@ def test_filtering_exact_string_AND_matching_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"store": ["example_corp"]})
+    topic, queue = _setup_filter_policy_test({"store": ["example_corp"]})
 
     topic.publish(
         Message="no match",
@@ -564,7 +703,7 @@ def test_filtering_exact_string_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_string_no_attributes_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"store": ["example_corp"]})
+    topic, queue = _setup_filter_policy_test({"store": ["example_corp"]})
 
     topic.publish(Message="no match")
 
@@ -578,7 +717,7 @@ def test_filtering_exact_string_no_attributes_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_number_int():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100]})
+    topic, queue = _setup_filter_policy_test({"price": [100]})
 
     topic.publish(
         Message="match",
@@ -595,7 +734,7 @@ def test_filtering_exact_number_int():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_number_float():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100.1]})
+    topic, queue = _setup_filter_policy_test({"price": [100.1]})
 
     topic.publish(
         Message="match",
@@ -612,7 +751,7 @@ def test_filtering_exact_number_float():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_number_float_accuracy():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100.123456789]})
+    topic, queue = _setup_filter_policy_test({"price": [100.123456789]})
 
     topic.publish(
         Message="match",
@@ -633,7 +772,7 @@ def test_filtering_exact_number_float_accuracy():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_number_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100]})
+    topic, queue = _setup_filter_policy_test({"price": [100]})
 
     topic.publish(
         Message="no match",
@@ -650,7 +789,7 @@ def test_filtering_exact_number_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_exact_number_with_string_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100]})
+    topic, queue = _setup_filter_policy_test({"price": [100]})
 
     topic.publish(
         Message="no match",
@@ -667,7 +806,7 @@ def test_filtering_exact_number_with_string_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_string_array_match():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {"customer_interests": ["basketball", "baseball"]}
     )
 
@@ -700,9 +839,7 @@ def test_filtering_string_array_match():
 @mock_sqs
 @mock_sns
 def test_filtering_string_array_no_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"customer_interests": ["baseball"]}
-    )
+    topic, queue = _setup_filter_policy_test({"customer_interests": ["baseball"]})
 
     topic.publish(
         Message="no_match",
@@ -724,7 +861,7 @@ def test_filtering_string_array_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_string_array_with_number_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100, 500]})
+    topic, queue = _setup_filter_policy_test({"price": [100, 500]})
 
     topic.publish(
         Message="match",
@@ -745,9 +882,7 @@ def test_filtering_string_array_with_number_match():
 @mock_sqs
 @mock_sns
 def test_filtering_string_array_with_number_float_accuracy_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"price": [100.123456789, 500]}
-    )
+    topic, queue = _setup_filter_policy_test({"price": [100.123456789, 500]})
 
     topic.publish(
         Message="match",
@@ -772,7 +907,7 @@ def test_filtering_string_array_with_number_float_accuracy_match():
 @mock_sns
 # this is the correct behavior from SNS
 def test_filtering_string_array_with_number_no_array_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100, 500]})
+    topic, queue = _setup_filter_policy_test({"price": [100, 500]})
 
     topic.publish(
         Message="match",
@@ -791,7 +926,7 @@ def test_filtering_string_array_with_number_no_array_match():
 @mock_sqs
 @mock_sns
 def test_filtering_string_array_with_number_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [500]})
+    topic, queue = _setup_filter_policy_test({"price": [500]})
 
     topic.publish(
         Message="no_match",
@@ -811,7 +946,7 @@ def test_filtering_string_array_with_number_no_match():
 @mock_sns
 # this is the correct behavior from SNS
 def test_filtering_string_array_with_string_no_array_no_match():
-    topic, subscription, queue = _setup_filter_policy_test({"price": [100]})
+    topic, queue = _setup_filter_policy_test({"price": [100]})
 
     topic.publish(
         Message="no_match",
@@ -830,9 +965,7 @@ def test_filtering_string_array_with_string_no_array_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_attribute_key_exists_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"store": [{"exists": True}]}
-    )
+    topic, queue = _setup_filter_policy_test({"store": [{"exists": True}]})
 
     topic.publish(
         Message="match",
@@ -853,9 +986,7 @@ def test_filtering_attribute_key_exists_match():
 @mock_sqs
 @mock_sns
 def test_filtering_attribute_key_exists_no_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"store": [{"exists": True}]}
-    )
+    topic, queue = _setup_filter_policy_test({"store": [{"exists": True}]})
 
     topic.publish(
         Message="no match",
@@ -874,9 +1005,7 @@ def test_filtering_attribute_key_exists_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_attribute_key_not_exists_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"store": [{"exists": False}]}
-    )
+    topic, queue = _setup_filter_policy_test({"store": [{"exists": False}]})
 
     topic.publish(
         Message="match",
@@ -897,9 +1026,7 @@ def test_filtering_attribute_key_not_exists_match():
 @mock_sqs
 @mock_sns
 def test_filtering_attribute_key_not_exists_no_match():
-    topic, subscription, queue = _setup_filter_policy_test(
-        {"store": [{"exists": False}]}
-    )
+    topic, queue = _setup_filter_policy_test({"store": [{"exists": False}]})
 
     topic.publish(
         Message="no match",
@@ -918,7 +1045,7 @@ def test_filtering_attribute_key_not_exists_no_match():
 @mock_sqs
 @mock_sns
 def test_filtering_all_AND_matching_match():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {
             "store": [{"exists": True}],
             "event": ["order_cancelled"],
@@ -962,7 +1089,7 @@ def test_filtering_all_AND_matching_match():
 @mock_sqs
 @mock_sns
 def test_filtering_all_AND_matching_no_match():
-    topic, subscription, queue = _setup_filter_policy_test(
+    topic, queue = _setup_filter_policy_test(
         {
             "store": [{"exists": True}],
             "event": ["order_cancelled"],

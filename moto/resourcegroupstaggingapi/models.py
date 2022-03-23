@@ -1,11 +1,9 @@
-from __future__ import unicode_literals
 import uuid
-import six
-from boto3 import Session
 
 from moto.core import ACCOUNT_ID
 from moto.core import BaseBackend
 from moto.core.exceptions import RESTError
+from moto.core.utils import BackendDict
 
 from moto.s3 import s3_backends
 from moto.ec2 import ec2_backends
@@ -13,10 +11,11 @@ from moto.elb import elb_backends
 from moto.elbv2 import elbv2_backends
 from moto.kinesis import kinesis_backends
 from moto.kms import kms_backends
-from moto.rds2 import rds2_backends
+from moto.rds import rds_backends
 from moto.glacier import glacier_backends
 from moto.redshift import redshift_backends
 from moto.emr import emr_backends
+from moto.awslambda import lambda_backends
 
 # Left: EC2 ElastiCache RDS ELB CloudFront WorkSpaces Lambda EMR Glacier Kinesis Redshift Route53
 # StorageGateway DynamoDB MachineLearning ACM DirectConnect DirectoryService CloudHSM
@@ -25,7 +24,7 @@ from moto.emr import emr_backends
 
 class ResourceGroupsTaggingAPIBackend(BaseBackend):
     def __init__(self, region_name=None):
-        super(ResourceGroupsTaggingAPIBackend, self).__init__()
+        super().__init__()
         self.region_name = region_name
 
         self._pages = {}
@@ -84,9 +83,9 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
     @property
     def rds_backend(self):
         """
-        :rtype: moto.rds2.models.RDS2Backend
+        :rtype: moto.rds.models.RDSBackend
         """
-        return rds2_backends[self.region_name]
+        return rds_backends[self.region_name]
 
     @property
     def glacier_backend(self):
@@ -108,6 +107,13 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         :rtype: moto.redshift.models.RedshiftBackend
         """
         return redshift_backends[self.region_name]
+
+    @property
+    def lambda_backend(self):
+        """
+        :rtype: moto.awslambda.models.LambdaBackend
+        """
+        return lambda_backends[self.region_name]
 
     def _get_resources_generator(self, tag_filters=None, resource_type_filters=None):
         # Look at
@@ -293,7 +299,7 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         # ELB, resource type elasticloadbalancing:loadbalancer
         def get_elbv2_tags(arn):
             result = []
-            for key, value in self.elbv2_backend.load_balancers[elb.arn].tags.items():
+            for key, value in self.elbv2_backend.load_balancers[arn].tags.items():
                 result.append({"Key": key, "Value": value})
             return result
 
@@ -312,9 +318,7 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         # ELB Target Group, resource type elasticloadbalancing:targetgroup
         def get_target_group_tags(arn):
             result = []
-            for key, value in self.elbv2_backend.target_groups[
-                target_group.arn
-            ].tags.items():
+            for key, value in self.elbv2_backend.target_groups[arn].tags.items():
                 result.append({"Key": key, "Value": value})
             return result
 
@@ -352,11 +356,55 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
                 yield {"ResourceARN": "{0}".format(kms_key.arn), "Tags": tags}
 
         # RDS Instance
+        if (
+            not resource_type_filters
+            or "rds" in resource_type_filters
+            or "rds:db" in resource_type_filters
+        ):
+            for database in self.rds_backend.databases.values():
+                tags = database.get_tags()
+                if not tags or not tag_filter(tags):
+                    continue
+                yield {
+                    "ResourceARN": database.db_instance_arn,
+                    "Tags": tags,
+                }
+
         # RDS Reserved Database Instance
         # RDS Option Group
         # RDS Parameter Group
         # RDS Security Group
+
         # RDS Snapshot
+        if (
+            not resource_type_filters
+            or "rds" in resource_type_filters
+            or "rds:snapshot" in resource_type_filters
+        ):
+            for snapshot in self.rds_backend.database_snapshots.values():
+                tags = snapshot.get_tags()
+                if not tags or not tag_filter(tags):
+                    continue
+                yield {
+                    "ResourceARN": snapshot.snapshot_arn,
+                    "Tags": tags,
+                }
+
+        # RDS Cluster Snapshot
+        if (
+            not resource_type_filters
+            or "rds" in resource_type_filters
+            or "rds:cluster-snapshot" in resource_type_filters
+        ):
+            for snapshot in self.rds_backend.cluster_snapshots.values():
+                tags = snapshot.get_tags()
+                if not tags or not tag_filter(tags):
+                    continue
+                yield {
+                    "ResourceARN": snapshot.snapshot_arn,
+                    "Tags": tags,
+                }
+
         # RDS Subnet Group
         # RDS Event Subscription
 
@@ -393,6 +441,23 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         # VPC Subnet
         # VPC Virtual Private Gateway
         # VPC VPN Connection
+
+        # Lambda Instance
+        def transform_lambda_tags(dictTags):
+            result = []
+            for key, value in dictTags.items():
+                result.append({"Key": key, "Value": value})
+            return result
+
+        if not resource_type_filters or "lambda" in resource_type_filters:
+            for f in self.lambda_backend.list_functions():
+                tags = transform_lambda_tags(f.tags)
+                if not tags or not tag_filter(tags):
+                    continue
+                yield {
+                    "ResourceARN": f.function_arn,
+                    "Tags": tags,
+                }
 
     def _get_tag_keys_generator(self):
         # Look at
@@ -546,7 +611,7 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         try:
             while True:
                 # Generator format: [{'ResourceARN': str, 'Tags': [{'Key': str, 'Value': str]}, ...]
-                next_item = six.next(generator)
+                next_item = next(generator)
                 resource_tags = len(next_item["Tags"])
 
                 if current_resources >= resources_per_page:
@@ -596,7 +661,7 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         try:
             while True:
                 # Generator format: ['tag', 'tag', 'tag', ...]
-                next_item = six.next(generator)
+                next_item = next(generator)
 
                 if current_tags + 1 >= 128:
                     break
@@ -642,7 +707,7 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
         try:
             while True:
                 # Generator format: ['value', 'value', 'value', ...]
-                next_item = six.next(generator)
+                next_item = next(generator)
 
                 if current_tags + 1 >= 128:
                     break
@@ -677,14 +742,6 @@ class ResourceGroupsTaggingAPIBackend(BaseBackend):
     #     return failed_resources_map
 
 
-resourcegroupstaggingapi_backends = {}
-for region in Session().get_available_regions("resourcegroupstaggingapi"):
-    resourcegroupstaggingapi_backends[region] = ResourceGroupsTaggingAPIBackend(region)
-for region in Session().get_available_regions(
-    "resourcegroupstaggingapi", partition_name="aws-us-gov"
-):
-    resourcegroupstaggingapi_backends[region] = ResourceGroupsTaggingAPIBackend(region)
-for region in Session().get_available_regions(
-    "resourcegroupstaggingapi", partition_name="aws-cn"
-):
-    resourcegroupstaggingapi_backends[region] = ResourceGroupsTaggingAPIBackend(region)
+resourcegroupstaggingapi_backends = BackendDict(
+    ResourceGroupsTaggingAPIBackend, "resourcegroupstaggingapi"
+)

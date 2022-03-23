@@ -1,4 +1,3 @@
-from __future__ import unicode_literals
 import json
 import re
 from datetime import datetime
@@ -6,14 +5,14 @@ from functools import wraps
 
 import pytz
 
-from six.moves.urllib.parse import urlparse
+from urllib.parse import urlparse
 from moto.core.responses import AWSServiceSpec
 from moto.core.responses import BaseResponse
 from moto.core.responses import xml_to_json_response
 from moto.core.utils import tags_from_query_string
-from .exceptions import EmrError
+from .exceptions import ValidationException
 from .models import emr_backends
-from .utils import steps_from_query_string, Unflattener
+from .utils import steps_from_query_string, Unflattener, ReleaseLabel
 
 
 def generate_boto3_response(operation):
@@ -102,16 +101,34 @@ class ElasticMapReduceResponse(BaseResponse):
     def cancel_steps(self):
         raise NotImplementedError
 
+    @generate_boto3_response("CreateSecurityConfiguration")
     def create_security_configuration(self):
-        raise NotImplementedError
+        name = self._get_param("Name")
+        security_configuration = self._get_param("SecurityConfiguration")
+        resp = self.backend.create_security_configuration(
+            name=name, security_configuration=security_configuration
+        )
+        template = self.response_template(CREATE_SECURITY_CONFIGURATION_TEMPLATE)
+        return template.render(name=name, creation_date_time=resp.creation_date_time)
 
+    @generate_boto3_response("DescribeSecurityConfiguration")
+    def describe_security_configuration(self):
+        name = self._get_param("Name")
+        security_configuration = self.backend.get_security_configuration(name=name)
+        template = self.response_template(DESCRIBE_SECURITY_CONFIGURATION_TEMPLATE)
+        return template.render(security_configuration=security_configuration)
+
+    @generate_boto3_response("DeleteSecurityConfiguration")
     def delete_security_configuration(self):
-        raise NotImplementedError
+        name = self._get_param("Name")
+        self.backend.delete_security_configuration(name=name)
+        template = self.response_template(DELETE_SECURITY_CONFIGURATION_TEMPLATE)
+        return template.render()
 
     @generate_boto3_response("DescribeCluster")
     def describe_cluster(self):
         cluster_id = self._get_param("ClusterId")
-        cluster = self.backend.get_cluster(cluster_id)
+        cluster = self.backend.describe_cluster(cluster_id)
         template = self.response_template(DESCRIBE_CLUSTER_TEMPLATE)
         return template.render(cluster=cluster)
 
@@ -167,8 +184,20 @@ class ElasticMapReduceResponse(BaseResponse):
         template = self.response_template(LIST_INSTANCE_GROUPS_TEMPLATE)
         return template.render(instance_groups=instance_groups, marker=marker)
 
+    @generate_boto3_response("ListInstances")
     def list_instances(self):
-        raise NotImplementedError
+        cluster_id = self._get_param("ClusterId")
+        marker = self._get_param("Marker")
+        instance_group_id = self._get_param("InstanceGroupId")
+        instance_group_types = self._get_param("InstanceGroupTypes")
+        instances, marker = self.backend.list_instances(
+            cluster_id,
+            marker=marker,
+            instance_group_id=instance_group_id,
+            instance_group_types=instance_group_types,
+        )
+        template = self.response_template(LIST_INSTANCES_TEMPLATE)
+        return template.render(instances=instances, marker=marker)
 
     @generate_boto3_response("ListSteps")
     def list_steps(self):
@@ -189,9 +218,6 @@ class ElasticMapReduceResponse(BaseResponse):
         cluster = self.backend.modify_cluster(cluster_id, step_concurrency_level)
         template = self.response_template(MODIFY_CLUSTER_TEMPLATE)
         return template.render(cluster=cluster)
-
-    def describe_security_configuration(self):
-        raise NotImplementedError
 
     @generate_boto3_response("ModifyInstanceGroups")
     def modify_instance_groups(self):
@@ -250,6 +276,7 @@ class ElasticMapReduceResponse(BaseResponse):
             log_uri=self._get_param("LogUri"),
             job_flow_role=self._get_param("JobFlowRole"),
             service_role=self._get_param("ServiceRole"),
+            auto_scaling_role=self._get_param("AutoScalingRole"),
             steps=steps_from_query_string(self._get_list_prefix("Steps.member")),
             visible_to_all_users=self._get_bool_param("VisibleToAllUsers", False),
             instance_attrs=instance_attrs,
@@ -293,11 +320,7 @@ class ElasticMapReduceResponse(BaseResponse):
                     "Only one AMI version and release label may be specified. "
                     "Provided AMI: {0}, release label: {1}."
                 ).format(ami_version, release_label)
-                raise EmrError(
-                    error_type="ValidationException",
-                    message=message,
-                    template="error_json",
-                )
+                raise ValidationException(message=message)
         else:
             if ami_version:
                 kwargs["requested_ami_version"] = ami_version
@@ -308,24 +331,51 @@ class ElasticMapReduceResponse(BaseResponse):
         custom_ami_id = self._get_param("CustomAmiId")
         if custom_ami_id:
             kwargs["custom_ami_id"] = custom_ami_id
-            if release_label and release_label < "emr-5.7.0":
+            if release_label and (
+                ReleaseLabel(release_label) < ReleaseLabel("emr-5.7.0")
+            ):
                 message = "Custom AMI is not allowed"
-                raise EmrError(
-                    error_type="ValidationException",
-                    message=message,
-                    template="error_json",
-                )
+                raise ValidationException(message=message)
             elif ami_version:
                 message = "Custom AMI is not supported in this version of EMR"
-                raise EmrError(
-                    error_type="ValidationException",
-                    message=message,
-                    template="error_json",
-                )
+                raise ValidationException(message=message)
 
         step_concurrency_level = self._get_param("StepConcurrencyLevel")
         if step_concurrency_level:
             kwargs["step_concurrency_level"] = step_concurrency_level
+
+        security_configuration = self._get_param("SecurityConfiguration")
+        if security_configuration:
+            kwargs["security_configuration"] = security_configuration
+
+        kerberos_attributes = {}
+        kwargs["kerberos_attributes"] = kerberos_attributes
+
+        realm = self._get_param("KerberosAttributes.Realm")
+        if realm:
+            kerberos_attributes["Realm"] = realm
+
+        kdc_admin_password = self._get_param("KerberosAttributes.KdcAdminPassword")
+        if kdc_admin_password:
+            kerberos_attributes["KdcAdminPassword"] = kdc_admin_password
+
+        cross_realm_principal_password = self._get_param(
+            "KerberosAttributes.CrossRealmTrustPrincipalPassword"
+        )
+        if cross_realm_principal_password:
+            kerberos_attributes[
+                "CrossRealmTrustPrincipalPassword"
+            ] = cross_realm_principal_password
+
+        ad_domain_join_user = self._get_param("KerberosAttributes.ADDomainJoinUser")
+        if ad_domain_join_user:
+            kerberos_attributes["ADDomainJoinUser"] = ad_domain_join_user
+
+        ad_domain_join_password = self._get_param(
+            "KerberosAttributes.ADDomainJoinPassword"
+        )
+        if ad_domain_join_password:
+            kerberos_attributes["ADDomainJoinPassword"] = ad_domain_join_password
 
         cluster = self.backend.run_job_flow(**kwargs)
 
@@ -345,7 +395,13 @@ class ElasticMapReduceResponse(BaseResponse):
                 self._parse_ebs_configuration(ig)
                 # Adding support for auto_scaling_policy
                 Unflattener.unflatten_complex_params(ig, "auto_scaling_policy")
-            self.backend.add_instance_groups(cluster.id, instance_groups)
+            instance_group_result = self.backend.add_instance_groups(
+                cluster.id, instance_groups
+            )
+            for i in range(0, len(instance_group_result)):
+                self.backend.add_instances(
+                    cluster.id, instance_groups[i], instance_group_result[i]
+                )
 
         tags = self._get_list_prefix("Tags.member")
         if tags:
@@ -437,7 +493,7 @@ class ElasticMapReduceResponse(BaseResponse):
 
     @generate_boto3_response("SetTerminationProtection")
     def set_termination_protection(self):
-        termination_protection = self._get_param("TerminationProtected")
+        termination_protection = self._get_bool_param("TerminationProtected")
         job_ids = self._get_multi_param("JobFlowIds.member")
         self.backend.set_termination_protection(job_ids, termination_protection)
         template = self.response_template(SET_TERMINATION_PROTECTION_TEMPLATE)
@@ -461,19 +517,22 @@ class ElasticMapReduceResponse(BaseResponse):
     @generate_boto3_response("PutAutoScalingPolicy")
     def put_auto_scaling_policy(self):
         cluster_id = self._get_param("ClusterId")
+        cluster = self.backend.describe_cluster(cluster_id)
         instance_group_id = self._get_param("InstanceGroupId")
         auto_scaling_policy = self._get_param("AutoScalingPolicy")
         instance_group = self.backend.put_auto_scaling_policy(
             instance_group_id, auto_scaling_policy
         )
         template = self.response_template(PUT_AUTO_SCALING_POLICY)
-        return template.render(cluster_id=cluster_id, instance_group=instance_group)
+        return template.render(
+            cluster_id=cluster_id, cluster=cluster, instance_group=instance_group
+        )
 
     @generate_boto3_response("RemoveAutoScalingPolicy")
     def remove_auto_scaling_policy(self):
         cluster_id = self._get_param("ClusterId")
         instance_group_id = self._get_param("InstanceGroupId")
-        instance_group = self.backend.put_auto_scaling_policy(instance_group_id, None)
+        instance_group = self.backend.remove_auto_scaling_policy(instance_group_id)
         template = self.response_template(REMOVE_AUTO_SCALING_POLICY)
         return template.render(cluster_id=cluster_id, instance_group=instance_group)
 
@@ -560,6 +619,23 @@ DESCRIBE_CLUSTER_TEMPLATE = """<DescribeClusterResponse xmlns="http://elasticmap
         <ServiceAccessSecurityGroup>{{ cluster.service_access_security_group }}</ServiceAccessSecurityGroup>
       </Ec2InstanceAttributes>
       <Id>{{ cluster.id }}</Id>
+      <KerberosAttributes>
+        {% if 'Realm' in cluster.kerberos_attributes%}
+        <Realm>{{ cluster.kerberos_attributes['Realm'] }}</Realm>
+        {% endif %}
+        {% if 'KdcAdminPassword' in cluster.kerberos_attributes%}
+        <KdcAdminPassword>{{ cluster.kerberos_attributes['KdcAdminPassword'] }}</KdcAdminPassword>
+        {% endif %}
+        {% if 'CrossRealmTrustPrincipalPassword' in cluster.kerberos_attributes%}
+        <CrossRealmTrustPrincipalPassword>{{ cluster.kerberos_attributes['CrossRealmTrustPrincipalPassword'] }}</CrossRealmTrustPrincipalPassword>
+        {% endif %}
+        {% if 'ADDomainJoinUser' in cluster.kerberos_attributes%}
+        <ADDomainJoinUser>{{ cluster.kerberos_attributes['ADDomainJoinUser'] }}</ADDomainJoinUser>
+        {% endif %}
+        {% if 'ADDomainJoinPassword' in cluster.kerberos_attributes%}
+        <ADDomainJoinPassword>{{ cluster.kerberos_attributes['ADDomainJoinPassword'] }}</ADDomainJoinPassword>
+        {% endif %}
+      </KerberosAttributes>
       <LogUri>{{ cluster.log_uri }}</LogUri>
       <MasterPublicDnsName>ec2-184-0-0-1.us-west-1.compute.amazonaws.com</MasterPublicDnsName>
       <Name>{{ cluster.name }}</Name>
@@ -573,8 +649,11 @@ DESCRIBE_CLUSTER_TEMPLATE = """<DescribeClusterResponse xmlns="http://elasticmap
       {% if cluster.running_ami_version is not none %}
       <RunningAmiVersion>{{ cluster.running_ami_version }}</RunningAmiVersion>
       {% endif %}
-      <SecurityConfiguration/>
+      {% if cluster.security_configuration is not none %}
+      <SecurityConfiguration>{{ cluster.security_configuration }}</SecurityConfiguration>
+      {% endif %}
       <ServiceRole>{{ cluster.service_role }}</ServiceRole>
+      <AutoScalingRole>{{ cluster.auto_scaling_role }}</AutoScalingRole>
       <Status>
         <State>{{ cluster.state }}</State>
         <StateChangeReason>
@@ -604,6 +683,7 @@ DESCRIBE_CLUSTER_TEMPLATE = """<DescribeClusterResponse xmlns="http://elasticmap
       <TerminationProtected>{{ cluster.termination_protected|lower }}</TerminationProtected>
       <VisibleToAllUsers>{{ cluster.visible_to_all_users|lower }}</VisibleToAllUsers>
       <StepConcurrencyLevel>{{ cluster.step_concurrency_level }}</StepConcurrencyLevel>
+      <ClusterArn>{{ cluster.arn }}</ClusterArn>
     </Cluster>
   </DescribeClusterResult>
   <ResponseMetadata>
@@ -853,6 +933,7 @@ LIST_CLUSTERS_TEMPLATE = """<ListClustersResponse xmlns="http://elasticmapreduce
             {% endif %}
           </Timeline>
         </Status>
+        <ClusterArn>{{ cluster.arn }}</ClusterArn>
       </member>
       {% endfor %}
     </Clusters>
@@ -1031,6 +1112,55 @@ LIST_INSTANCE_GROUPS_TEMPLATE = """<ListInstanceGroupsResponse xmlns="http://ela
   </ResponseMetadata>
 </ListInstanceGroupsResponse>"""
 
+LIST_INSTANCES_TEMPLATE = """<ListInstancesResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
+  <ListInstancesResult>
+    <Instances>
+     {% for instance in instances %}
+      <member>
+        <Id>{{ instance.id }}</Id>
+        <Ec2InstanceId>{{ instance.ec2_instance_id }}</Ec2InstanceId>
+        <PublicDnsName>{{ instance.details.public_dns }}</PublicDnsName>
+        <PublicIpAddress>{{ instance.details.public_ip }}</PublicIpAddress>
+        <PrivateDnsName>{{ instance.details.private_dns }}</PrivateDnsName>
+        <PrivateIpAddress>{{ instance.details.private_ip }}</PrivateIpAddress>
+        <InstanceGroupId>{{ instance.instance_group.id }}</InstanceGroupId>
+        <InstanceFleetId>{{ instance.instance_fleet_id }}</InstanceFleetId>
+        <Market>{{ instance.instance_group.market }}</Market>
+        <InstanceType>{{ instance.details.instance_type }}</InstanceType>
+         <EbsVolumes>
+              {% for volume in instance.details.block_device_mapping %}
+          <member>
+              <Device>{{ volume }}</Device>
+              <VolumeId>{{ instance.details.block_device_mapping[volume].volume_id }}</VolumeId>
+          </member>
+              {% endfor %}
+        </EbsVolumes>
+       <Status>
+          <State>{{ instance.instance_group.state }}</State>
+          <StateChangeReason>
+            {% if instance.state_change_reason is not none %}
+            <Message>{{ instance.state_change_reason }}</Message>
+            {% endif %}
+          </StateChangeReason>
+          <Timeline>
+            <CreationDateTime>{{ instance.instance_group.creation_datetime.isoformat() }}</CreationDateTime>
+            {% if instance.instance_group.end_datetime is not none %}
+            <EndDateTime>{{ instance.instance_group.end_datetime.isoformat() }}</EndDateTime>
+            {% endif %}
+            {% if instance.instance_group.ready_datetime is not none %}
+            <ReadyDateTime>{{ instance.instance_group.ready_datetime.isoformat() }}</ReadyDateTime>
+            {% endif %}
+          </Timeline>
+        </Status>
+      </member>
+    {% endfor %}
+    </Instances>
+ </ListInstancesResult>
+ <ResponseMetadata>
+    <RequestId>4248c46c-71c0-4772-b155-0e992dc30027</RequestId>
+  </ResponseMetadata>
+</ListInstancesResponse>"""
+
 LIST_STEPS_TEMPLATE = """<ListStepsResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
   <ListStepsResult>
     <Steps>
@@ -1113,6 +1243,7 @@ REMOVE_TAGS_TEMPLATE = """<RemoveTagsResponse xmlns="http://elasticmapreduce.ama
 RUN_JOB_FLOW_TEMPLATE = """<RunJobFlowResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
   <RunJobFlowResult>
     <JobFlowId>{{ cluster.id }}</JobFlowId>
+    <ClusterArn>{{ cluster.arn }}</ClusterArn>
   </RunJobFlowResult>
   <ResponseMetadata>
     <RequestId>8296d8b8-ed85-11dd-9877-6fad448a8419</RequestId>
@@ -1242,6 +1373,7 @@ PUT_AUTO_SCALING_POLICY = """<PutAutoScalingPolicyResponse xmlns="http://elastic
         {% endif %}
     </AutoScalingPolicy>
     {% endif %}
+    <ClusterArn>{{ cluster.arn }}</ClusterArn>
   </PutAutoScalingPolicyResult>
   <ResponseMetadata>
     <RequestId>d47379d9-b505-49af-9335-a68950d82535</RequestId>
@@ -1253,3 +1385,30 @@ REMOVE_AUTO_SCALING_POLICY = """<RemoveAutoScalingPolicyResponse xmlns="http://e
     <RequestId>c04a1042-5340-4c0a-a7b5-7779725ce4f7</RequestId>
   </ResponseMetadata>
 </RemoveAutoScalingPolicyResponse>"""
+
+CREATE_SECURITY_CONFIGURATION_TEMPLATE = """<CreateSecurityConfigurationResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
+  <CreateSecurityConfigurationResult>
+    <Name>{{name}}</Name>
+    <CreationDateTime>{{creation_date_time}}</CreationDateTime>
+  </CreateSecurityConfigurationResult>
+  <ResponseMetadata>
+    <RequestId>2690d7eb-ed86-11dd-9877-6fad448a8419</RequestId>
+  </ResponseMetadata>
+</CreateSecurityConfigurationResponse>"""
+
+DESCRIBE_SECURITY_CONFIGURATION_TEMPLATE = """<DescribeSecurityConfigurationResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
+  <DescribeSecurityConfigurationResult>
+    <Name>{{security_configuration['name']}}</Name>
+    <SecurityConfiguration>{{security_configuration['security_configuration']}}</SecurityConfiguration>
+    <CreationDateTime>{{security_configuration['creation_date_time']}}</CreationDateTime>
+  </DescribeSecurityConfigurationResult>
+  <ResponseMetadata>
+    <RequestId>2690d7eb-ed86-11dd-9877-6fad448a8419</RequestId>
+  </ResponseMetadata>
+</DescribeSecurityConfigurationResponse>"""
+
+DELETE_SECURITY_CONFIGURATION_TEMPLATE = """<DeleteSecurityConfigurationResponse xmlns="http://elasticmapreduce.amazonaws.com/doc/2009-03-31">
+  <ResponseMetadata>
+    <RequestId>2690d7eb-ed86-11dd-9877-6fad448a8419</RequestId>
+  </ResponseMetadata>
+</DeleteSecurityConfigurationResponse>"""

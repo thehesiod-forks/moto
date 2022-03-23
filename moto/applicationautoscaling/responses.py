@@ -1,4 +1,3 @@
-from __future__ import unicode_literals
 from moto.core.responses import BaseResponse
 import json
 from .models import (
@@ -21,8 +20,10 @@ class ApplicationAutoScalingResponse(BaseResponse):
         scalable_dimension = self._get_param("ScalableDimension")
         max_results = self._get_int_param("MaxResults", 50)
         marker = self._get_param("NextToken")
-        all_scalable_targets = self.applicationautoscaling_backend.describe_scalable_targets(
-            service_namespace, resource_ids, scalable_dimension
+        all_scalable_targets = (
+            self.applicationautoscaling_backend.describe_scalable_targets(
+                service_namespace, resource_ids, scalable_dimension
+            )
         )
         start = int(marker) + 1 if marker else 0
         next_token = None
@@ -33,7 +34,7 @@ class ApplicationAutoScalingResponse(BaseResponse):
         return json.dumps({"ScalableTargets": targets, "NextToken": next_token})
 
     def register_scalable_target(self):
-        """ Registers or updates a scalable target. """
+        """Registers or updates a scalable target."""
         self._validate_params()
         self.applicationautoscaling_backend.register_scalable_target(
             self._get_param("ServiceNamespace"),
@@ -47,7 +48,7 @@ class ApplicationAutoScalingResponse(BaseResponse):
         return json.dumps({})
 
     def deregister_scalable_target(self):
-        """ Deregisters a scalable target. """
+        """Deregisters a scalable target."""
         self._validate_params()
         self.applicationautoscaling_backend.deregister_scalable_target(
             self._get_param("ServiceNamespace"),
@@ -96,8 +97,8 @@ class ApplicationAutoScalingResponse(BaseResponse):
         return json.dumps({})
 
     def _validate_params(self):
-        """ Validate parameters.
-            TODO Integrate this validation with the validation in models.py
+        """Validate parameters.
+        TODO Integrate this validation with the validation in models.py
         """
         namespace = self._get_param("ServiceNamespace")
         dimension = self._get_param("ScalableDimension")
